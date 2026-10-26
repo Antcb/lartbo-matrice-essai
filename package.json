@@ -1,0 +1,7 @@
+{
+  "name": "lartbo-matrice-essai-verification",
+  "private": true,
+  "description": "Vérification automatique du site d'essai (aucune dépendance de l'application)",
+  "type": "module",
+  "devDependencies": { "playwright": "1.56.0" }
+}

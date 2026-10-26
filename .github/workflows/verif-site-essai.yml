@@ -1,0 +1,25 @@
+# SITE D'ESSAI lartbo-matrice-essai : vérifie après chaque publication GitHub Pages que le site affiche la version C1,
+# ne vise que le projet Supabase de TEST et ne fait aucune requête vers la production. Aucun secret utilisé.
+name: Vérification du site d'essai
+on:
+  page_build: {}
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  verif:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npx playwright install --with-deps chromium
+      - name: Attente de la mise en ligne
+        run: sleep 60
+      - name: Site d'essai (version, projet de test, aucune requête de production)
+        run: node tools/essai/verifier-lien.mjs
