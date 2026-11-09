@@ -5,7 +5,7 @@
 import { PROSPECT_LABEL, STATUSES, stClass, stColor } from '../constants.js';
 import { deptColor, projName, projectOptions } from '../selectors.js';
 import { S } from '../state.js';
-import { esc } from '../utils.js';
+import { esc, fmtDate } from '../utils.js';
 import { projPicker } from './projpicker.js';
 
 export const stBadge = s => `<span class="badge st-badge st-${stClass(s)}" style="--c:${stColor(s)}">${esc(s||'—')}</span>`;
@@ -56,7 +56,15 @@ export const fileRow = (f, act='openFile', del='delFile') => `<div class="file-r
 
 /** En-tête de page commun à tout le site : titre et actions sur la première ligne, filtres en dessous */
 export const viewHead = (title, {sub='', filters='', actions=''}={}) =>
-  `<div class="view-head"><div class="vh-top"><div class="vh-title"><h1>${title}</h1>${sub?`<span class="sub">${sub}</span>`:''}</div><span class="spacer"></span>${actions?`<div class="vh-actions">${actions}</div>`:''}</div>${filters?`<div class="vh-filters">${filters}</div>`:''}</div>`;
+  `<div class="view-head"><div class="vh-top"><div class="vh-title"><h1>${title}</h1>${sub?`<span class="sub">${sub}</span>`:''}</div><span class="spacer"></span>${actions?`<div class="vh-actions">${actions}</div>`:''}</div>${filters?`<div class="vh-filters">${filters}</div>`:''}${filters.includes('pp-btn') ? '' : artistContext()}</div>`;
+
+/** Artiste(s) sélectionné(s) dans le filtre (v1.56) : rappelé sur les pages sans filtre artiste, car il sert de valeur par défaut
+ *  aux nouvelles fiches (date, tâche) ; « Désélectionner » le retire partout, à tout moment */
+export function artistContext(){
+  const names = S.projects.map(id => projName(id)).filter(Boolean);
+  if (!names.length) return '';
+  return `<p class="artist-ctx">Artiste sélectionné${names.length > 1 ? 's' : ''} : <b>${esc(names.join(', '))}</b> <button type="button" class="btn sm ghost" data-act="clearArtists">Désélectionner</button></p>`;
+}
 
 /** Bloc repliable */
 export const fold = (key, title, inner, {open=false, count=null}={}) => {
@@ -65,3 +73,10 @@ export const fold = (key, title, inner, {open=false, count=null}={}) => {
 };
 
 export { projPicker };
+
+/** Mention d'une date archivée (v1.60.3) là où elle reste affichée (vues financières, historique d'un artiste ou d'une structure) */
+export const archivedTag = s => s?.archived_at ? ' <span class="badge tag">date archivée</span>' : '';
+/** Relances suspendues après la restauration d'une date (v1.60.3, décision d'Anthony du 07/11) : rien ne part tant qu'elles ne sont
+ *  pas réactivées explicitement, avec le choix de leurs prochaines échéances */
+export const remindersSuspendedNote = (s, level = 1) => s?.reminders_suspended_at ? `<p class="warn-txt small full">Relances suspendues depuis la restauration du ${fmtDate(String(s.reminders_suspended_at).slice(0, 10))} : aucune relance ne part.
+  <button type="button" class="btn sm" data-act="reactivateReminders" data-id="${s.id}" data-level="${level}">Réactiver les relances…</button></p>` : '';

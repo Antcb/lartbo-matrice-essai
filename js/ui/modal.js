@@ -8,10 +8,11 @@
  */
 import { render } from '../app.js';
 import { S } from '../state.js';
-import { $, esc, toast } from '../utils.js';
+import { $, esc, toast, checkMails } from '../utils.js';
 import { SOURCES, acInput, commitTypedText } from './autocomplete.js';
 import { dateInput } from './datefield.js';
 import { tagPicker, commitTags } from './tagpicker.js';
+import { commitRecipients } from './recipients.js';
 import { projPicker } from './projpicker.js';
 import { trackModal } from './history.js';
 import { modalSaved, watchModal } from './drafts.js';
@@ -25,14 +26,16 @@ export function field(f, v){
   else if (f.type==='project') input = projPicker(v, {attrs:`name="${f.k}" id="${id}"`, allLabel: f.allLabel||'', cls:'sel pp-field'});
   else if (f.type==='textarea') input = `<textarea id="${id}" name="${f.k}" ${f.rows?`rows="${f.rows}"`:''}>${esc(v??'')}</textarea>`;
   else if (f.type==='date') input = dateInput(v, `name="${f.k}" id="${id}"`);
-  else if (f.type==='ac') input = acInput(f.kind, {value:v, attrs:`name="${f.k}"`, create:f.create, placeholder:f.placeholder||'Taper pour chercher…'});
+  else if (f.type==='ac') input = acInput(f.kind, {value:v, attrs:`name="${f.k}"`, create:f.create, activeOnly:f.activeOnly, placeholder:f.placeholder||'Taper pour chercher…'});
   else if (f.type==='fulladdr') input = acInput('fulladdr', {value:v, text:v||'', attrs:`name="${f.k}"`, placeholder:f.placeholder||'Taper une adresse…'});
   else if (f.type==='place' || f.type==='city') input = acInput(f.type==='city'?'cities':'places', {value:v, text:v||'', attrs:`name="${f.k}"`, fill:f.fill??'', placeholder:f.placeholder||(f.type==='city'?'Taper une ville…':'Taper une adresse ou une ville…')});
+  // lieu d'une date (v1.60.2) : salle / festival connu (adresse, code postal, ville, coordonnées remplis) ou nom tapé librement
+  else if (f.type==='lieu') input = acInput('lieux', {value:v, text:v||'', attrs:`name="${f.k}"`, fill:f.fill??'', placeholder:f.placeholder||'Chercher une salle, un festival… ou taper le nom'});
   else if (f.type==='tags') input = tagPicker({id, name: f.k, values: Array.isArray(v) ? v : (v ? String(v).split(',').map(x=>x.trim()).filter(Boolean) : []), suggestions: typeof f.suggest === 'function' ? f.suggest() : (f.suggest || [])});
   else if (f.type==='links') input = linksPicker(f, v);
   else if (f.type==='checks') input = `<div class="checks pills">${f.options.map(([val,lab])=>`<label><input type="checkbox" name="${f.k}" value="${esc(val)}" ${(v||[]).includes(val)?'checked':''}> ${esc(lab)}</label>`).join('')}</div>`;
   else if (f.type==='files') input = `<div class="dropzone" data-drop-form="${f.k}"><label class="btn sm file-btn">Ajouter un fichier<input type="file" name="${f.k}" multiple class="file-input" data-filelist="${f.k}"></label><span class="drop-hint">ou glisse les fichiers ici</span><div class="muted file-list" id="fl-${f.k}"></div></div>`;
-  else input = `<input id="${id}" type="${f.type||'text'}" name="${f.k}" value="${esc(v??'')}" ${f.type==='number'?'step="any" inputmode="decimal"':''} ${f.placeholder?`placeholder="${esc(f.placeholder)}"`:''}>`;
+  else input = `<input id="${id}" type="${f.type||'text'}" name="${f.k}" value="${esc(v??'')}" ${f.type==='number'?'step="any" inputmode="decimal"':''} ${f.mails?'data-mails':''} ${f.placeholder?`placeholder="${esc(f.placeholder)}"`:''}>`;
   return `<div class="${cls}"><label for="${id}">${f.label}</label>${input}${f.help?`<div class="help">${f.help}</div>`:''}</div>`;
 }
 
@@ -55,17 +58,18 @@ export const MODALS = {};
 export let MODAL = null;
 
 /**
- * openModal({title, fields, values, onSave, onDelete, extra, extraTop, level, wide, saveLabel})
+ * openModal({title, fields, values, onSave, onDelete, deleteAsk, extra, extraTop, level, wide, saveLabel})
+ * deleteAsk() : question de suppression ({title, text, actions}, voir ui/dialog.js) ; onDelete(choix) reçoit la valeur du bouton choisi.
  * extraTop : contenu libre affiché avant les champs, extra : après.
  * onSave(valeurs) : renvoyer false pour garder la fenêtre ouverte.
  */
-export function openModal({title, fields, values={}, onSave, onDelete, extra='', extraTop='', level=1, wide=false, mail=false, footExtra='', saveLabel='Enregistrer'}){
+export function openModal({title, fields, values={}, onSave, onDelete, deleteAsk, extra='', extraTop='', level=1, wide=false, mail=false, footExtra='', saveLabel='Enregistrer'}){
   const dlg = $(level===2 ? '#modal2' : '#modal');
-  MODALS[level] = {fields, onSave, onDelete, dlg};
+  MODALS[level] = {fields, onSave, onDelete, deleteAsk, dlg};
   if (level===1) MODAL = MODALS[1];
   // mail : fenêtre haute, seul le texte du mail défile (champs en haut, boutons toujours visibles en bas)
   dlg.className = [wide || mail ? 'wide' : '', mail ? 'mail' : ''].filter(Boolean).join(' ');
-  dlg.innerHTML = `<form method="dialog" class="mform" data-level="${level}">
+  dlg.innerHTML = `<form method="dialog" class="mform" data-level="${level}" novalidate>
     <div class="modal-head"><h2>${esc(title)}</h2><button type="button" class="btn icon ghost" data-act="closeModal" data-level="${level}" aria-label="Fermer">✕</button></div>
     <div class="modal-body">${extraTop}${fields.map(f=>field(f, values[f.k])).join('')}${extra}</div>
     <div class="modal-foot">${onDelete?`<button type="button" class="btn ghost danger left" data-act="modalDelete" data-level="${level}">Supprimer</button>`:''}
@@ -83,10 +87,13 @@ export function openModal({title, fields, values={}, onSave, onDelete, extra='',
       ev.preventDefault();
       // un champ date en cours de saisie doit être validé avant lecture
       if (document.activeElement?.classList.contains('dt-txt')) document.activeElement.blur();
-      commitTypedText(ev.target); commitTags(ev.target);
+      commitTypedText(ev.target); commitTags(ev.target); commitRecipients(ev.target);   // adresse tapée dans Destinataire / Copie (v1.60.3)
       // un seul enregistrement à la fois : tous les boutons du bas attendent la fin (envoi, brouillon…)
       if (dlg._busy) return;
       // une date illisible ou une fin avant le début : on ne ferme pas, on montre le champ
+      // mail au mauvais format : message sous le champ, rien n'est enregistré (Q23)
+      const badMail = checkMails(ev.target);
+      if (badMail.length){ badMail[0].focus(); return; }
       const bad = ev.target.querySelector('.dt-txt.bad');
       if (bad){ toast(bad.title || 'Date à corriger', true); bad.focus(); return; }
       const out = readForm(ev.target, fields);

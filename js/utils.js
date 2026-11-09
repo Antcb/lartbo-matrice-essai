@@ -13,8 +13,55 @@ export const eur2 = n => n==null || n==='' || isNaN(n) ? '—' : Number(n).toLoc
 /** Montant courant : sans centimes quand il est rond (1 200 €), avec sinon (8 967,50 €) */
 export const eur = n => n==null || n==='' || isNaN(n) ? '—' : Number(n).toLocaleString('fr-FR',{style:'currency',currency:'EUR',minimumFractionDigits: Number(n) % 1 ? 2 : 0, maximumFractionDigits: 2});
 
-/** Date affichée partout en JJ/MM/AAAA (stockage : AAAA-MM-JJ) ; accepte aussi un horodatage */
-export const fmtDate = d => { if (!d) return ''; const s = String(d); return /^\d{4}-\d\d-\d\d$/.test(s) ? fmtNum(s) : /T/.test(s) ? new Date(s).toLocaleDateString('fr-FR') : s; };
+/** Mail valide (CONVENTIONS §3.4, Q23) : même expression que la base (contacts_clean) ; un champ vide est accepté (obligatoire vérifié à part) */
+// caractères invisibles (largeur nulle, inversion d'affichage…) refusés n'importe où dans l'adresse (relecture v1.50a)
+export const MAIL_RE = /^[^@\s\u200B-\u200F\u202A-\u202E\u2060\uFEFF]+@[^@\s\u200B-\u200F\u202A-\u202E\u2060\uFEFF]+\.[a-z]{2,}$/i;
+// une adresse contenant un caractère invisible est refusée (elle serait enregistrée telle quelle hors de la table des contacts)
+const mailText = v => String(v ?? '').trim();
+export const mailOk = v => !mailText(v) || MAIL_RE.test(mailText(v));
+/** Liste d'adresses (destinataires, copie) : séparées par des virgules ou des points-virgules (hors noms entre guillemets),
+ *  « Nom <adresse> » et « "Dupont, Jean" <adresse> » acceptés ; au moins une adresse si le champ n'est pas vide */
+export const mailsOk = v => {
+  const t = mailText(v); if (!t) return true;
+  const parts = t.split(MAIL_SEP).map(x => x.trim());
+  return parts.some(Boolean) && parts.every((x, i) => (x || (i === parts.length - 1 && i > 0)) && (!x || mailOk(mailAddr(x))));
+};
+/** Séparateur d'une liste d'adresses : virgule ou point-virgule hors noms entre guillemets */
+const MAIL_SEP = /[,;](?=(?:[^"]*"[^"]*")*[^"]*$)/;
+/** Adresses d'une liste (destinataires, copie), non vides */
+export const mailParts = v => String(v || '').split(MAIL_SEP).map(x => x.trim()).filter(Boolean);
+/** Adresse seule d'une écriture « Nom <adresse> » (sinon le texte lui-même), sans espaces autour */
+export const mailAddr = x => ((String(x || '').match(/<([^<>]*)>\s*$/) || [, x])[1]).trim();
+export const MAIL_MSG = 'Adresse mail invalide : vérifie le @ et le domaine';
+/** Erreur sous un champ (§9.1, Q23) : message en --danger sous le champ, bordure du champ en --danger ; msg vide = retire l'erreur */
+export function fieldError(input, msg){
+  if (!input) return;
+  // le message est toujours posé juste après le champ : on retire celui-là (et l'ancien emplacement, sous .field)
+  if (input.nextElementSibling?.matches?.('[data-field-err]')) input.nextElementSibling.remove();
+  (input.closest('.field') || input.parentElement)?.querySelector(':scope > .help.err[data-field-err]')?.remove();
+  input.classList.toggle('bad', !!msg); input.classList.toggle('invalid', !!msg);
+  if (msg){ const p = document.createElement('p'); p.className = 'help err'; p.dataset.fieldErr = '1'; p.textContent = msg; input.insertAdjacentElement('afterend', p); }
+}
+/** Champs mail visibles d'un formulaire : type email, ou liste d'adresses (attribut multiple ou data-mails) */
+export const mailInputs = form => [...form.querySelectorAll('input[type=email], input[data-mails]')].filter(i => !i.closest('[hidden]') && !i.disabled);
+const inputOk = i => (i.multiple || i.dataset.mails !== undefined) ? mailsOk(i.value) : mailOk(i.value);
+/** Mails d'un formulaire au mauvais format : erreurs posées sous chaque champ, renvoie les champs fautifs (les champs masqués sont ignorés) */
+export function checkMails(form){
+  const all = mailInputs(form);
+  all.forEach(i => fieldError(i, ''));
+  const bad = all.filter(i => !inputOk(i));
+  bad.forEach(i => fieldError(i, MAIL_MSG));
+  return bad;
+}
+/** Champs fautifs sans rien afficher (enregistrement automatique pendant la saisie) */
+export const badMails = form => mailInputs(form).filter(i => !inputOk(i));
+
+/** Fuseau de référence de toute règle métier (CONVENTIONS §1.2) */
+export const TZ = 'Europe/Paris';
+/** Jour (AAAA-MM-JJ) d'un horodatage, à Paris — jamais .slice(0,10) d'un horodatage (jour UTC : la veille entre 0 h et 2 h) */
+export const dayOf = ts => { if (!ts) return null; const s = String(ts); if (/^\d{4}-\d\d-\d\d$/.test(s)) return s; const d = new Date(s); return isNaN(d) ? null : d.toLocaleDateString('sv-SE', {timeZone: TZ}); };
+/** Date affichée partout en JJ/MM/AAAA (stockage : AAAA-MM-JJ) ; accepte aussi un horodatage complet (jour à Paris) */
+export const fmtDate = d => { if (!d) return ''; const s = String(d); return /^\d{4}-\d\d-\d\d$/.test(s) ? fmtNum(s) : /^\d{4}-\d\d-\d\d[ T]/.test(s) && dayOf(s) ? fmtNum(dayOf(s)) : s; };
 
 /** Date courte avec le jour : « sam. 10/01 » (listes compactes) */
 export const fmtShort = d => d ? `${new Date(String(d).slice(0,10)+'T12:00:00').toLocaleDateString('fr-FR',{weekday:'short'})} ${fmtNum(d).slice(0,5)}` : '';
@@ -23,11 +70,22 @@ export const fmtWeekday = d => d ? new Date(String(d).slice(0,10)+'T12:00:00').t
 
 export function fmtNum(d){ if (!d) return ''; const [y,m,j] = String(d).slice(0,10).split('-'); return `${j}/${m}/${y}`; }
 
-export const today = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset()*60000).toISOString().slice(0,10); };
+/** Aujourd'hui à Paris (AAAA-MM-JJ) */
+export const today = () => new Date().toLocaleDateString('sv-SE', {timeZone: TZ});
 
-export const daysUntil = d => d ? Math.round((new Date(d+'T00:00:00') - new Date(new Date().toDateString())) / 86400000) : null;
+/** J+n (ou J-n) d'une date simple — la seule fonction d'ajout de jours (CONVENTIONS §1.6) */
+export const addDays = (d, n) => { const x = new Date(String(d).slice(0, 10) + 'T12:00:00Z'); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); };
+/** M+n (ou M-n) d'une date simple ; un jour qui n'existe pas dans le mois d'arrivée devient le dernier jour du mois (29/02 + 1 an → 28/02) */
+export const addMonths = (d, n) => { const [y, m, j] = String(d).slice(0, 10).split('-').map(Number), t = (m - 1) + n, Y = y + Math.floor(t / 12), M = ((t % 12) + 12) % 12;
+  const last = new Date(Date.UTC(Y, M + 1, 0)).getUTCDate(); return `${Y}-${String(M + 1).padStart(2, '0')}-${String(Math.min(j, last)).padStart(2, '0')}`; };
+/** Arrondi au centime (CONVENTIONS §2.3) — la seule fonction d'arrondi */
+export const r2 = n => Math.round((Number(n) || 0) * 100) / 100;
+/** Pourcentage affiché « 15 % », « 33,33 % », « 5,5 % » : espace insécable, 2 décimales au plus, sans zéro inutile (§2.4) */
+export const pct = v => v == null || v === '' || isNaN(v) ? '—' : String(Math.round(Number(v) * 100) / 100).replace('.', ',') + '\u00a0%';
 
-export const daysBetween = (a, b) => Math.round((new Date(b+'T00:00:00') - new Date(a+'T00:00:00')) / 86400000);
+export const daysUntil = d => d ? daysBetween(today(), dayOf(d)) : null;   // jour de Paris
+
+export const daysBetween = (a, b) => Math.round((Date.parse(dayOf(b)+'T00:00:00Z') - Date.parse(dayOf(a)+'T00:00:00Z')) / 86400000);   // en jours de calendrier, sans effet heure d'été
 
 /** Texte comparable : minuscules, sans accents ; apostrophes (' ’ ‘ ` ´) et tirets comptent comme un espace */
 const APOS = /['‘’ʼ`´]/g;
@@ -147,6 +205,9 @@ export function safeHtml(html){
 }
 
 /** Jour ouvré : une échéance qui tombe un samedi ou un dimanche passe au lundi suivant (AAAA-MM-JJ) */
+/** Jour ouvré en reculant : samedi ou dimanche → vendredi précédent (boucle accueil & technique, Q12) */
+export const workDayBefore = iso => { if (!iso) return iso; const w = new Date(iso + 'T12:00:00Z').getUTCDay(); return w === 6 ? addDays(iso, -1) : w === 0 ? addDays(iso, -2) : iso; };
+
 export function workDay(iso){
   if (!iso) return iso;
   const d = new Date(iso + 'T12:00:00'), w = d.getDay();

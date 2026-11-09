@@ -1,4 +1,4 @@
-# SITE D'ESSAI lartbo-matrice-essai : vérifie après chaque publication GitHub Pages que le site affiche la version C1,
+# SITE D'ESSAI lartbo-matrice-essai : vérifie après chaque publication GitHub Pages que le site affiche la version calendriers,
 # ne vise que le projet Supabase de TEST et ne fait aucune requête vers la production. Aucun secret utilisé.
 name: Vérification du site d'essai
 on:

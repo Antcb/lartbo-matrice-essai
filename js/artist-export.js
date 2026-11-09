@@ -2,16 +2,20 @@
  * Export du budget d'une date pour l'artiste (ex. Pipi pour The Locos) : une page claire, prête à imprimer
  * ou à enregistrer en PDF — cachet, commission, chaque dépense, ce qui reste pour l'artiste et ce qui lui a été versé.
  */
-import { commissionAmount, commissionOf, isSolde, lineValue, showBudget } from './budget.js';
+import { commissionAmount, commissionOf, isSolde, lineValue, missingCostLines, missingCostText, showBudget } from './budget.js';
 import { artistResult } from './views/budget.js';
-import { byId } from './selectors.js';
-import { esc, eur2, fmtDate } from './utils.js';
+import { byId, showCommissionPct } from './selectors.js';
+import { commissionState } from './calc.js';
+import { esc, eur2, fmtDate, toast, pct, today } from './utils.js';
 
 export function exportArtistBudget(showId){
   const s = byId('shows', showId); if (!s) return;
   const p = byId('projects', s.project_id), b = showBudget(s), r = artistResult(s, b), com = commissionOf(s);
+  // commission (lot D1) : total, versements réels et reste ; le % n'est affiché que s'il correspond au total (sinon total fixé à part)
+  const cst = com ? commissionState(com) : null, pctN = com?.pct != null && String(com.pct).trim() !== '' ? Number(com.pct) : showCommissionPct(s);
+  const comPct = Math.abs(Math.round(b.gross * pctN) / 100 - commissionAmount(s)) < 0.005 ? String(pctN) : '';   // base : MG + part validée (coréalisation, v1.51)
   const artist = (p?.name || '').replace(/\s*•.*$/, ''), who = p?.artist_payee || artist;
-  const exp = b.lines.filter(l => !isSolde(l) && Math.abs(lineValue(l)) >= 0.005);
+  const exp = b.lines.filter(l => !isSolde(l) && Math.abs(lineValue(l)) >= 0.005), unknown = missingCostLines(s.id);
   const CAT = {Staff: 'Salaires', Movinmotion: 'Frais de paie (Movinmotion)', Taxes: 'Taxes'};
   const row = l => `<tr><td>${esc(CAT[l.category] || l.category || '')}</td><td>${esc(l.label || '')}${l.supplier ? ` <span class="m">· ${esc(l.supplier)}</span>` : ''}</td>
     <td class="n">${eur2(lineValue(l))}${l.amount == null ? ' <span class="m">(prévu)</span>' : ''}</td></tr>`;
@@ -32,14 +36,18 @@ export function exportArtistBudget(showId){
   footer{color:var(--m);font-size:12px;margin-top:28px}
   @media print{.bar{display:none} body{padding:0}}
 </style></head><body><main>
-  <div class="bar"><button onclick="print()">Imprimer / enregistrer en PDF</button></div>
+  <div class="bar"><button type="button" id="print-btn">Imprimer / enregistrer en PDF</button></div>
   <h1>${esc(artist)} — ${esc(s.venue || '')}</h1>
   <p class="sub">${esc(fmtDate(s.date))}${s.city ? ' · ' + esc(s.city) : ''} · montants HT</p>
 
   <h2>Le cachet</h2>
   <table><tbody>
-    <tr><td>Cachet HT</td><td class="n">${eur2(b.fee)}</td></tr>
-    <tr><td>Commission L’ArtBoristerie (${esc(String(com?.pct ?? s.artbo_pct ?? 15))} %)</td><td class="n">− ${eur2(commissionAmount(s))}</td></tr>
+    <tr><td>${b.share ? 'Minimum garanti HT' : 'Cachet HT'}</td><td class="n">${eur2(b.fee)}</td></tr>
+    ${b.share ? `<tr><td>Part du résultat (coréalisation)</td><td class="n">${eur2(b.share)}</td></tr><tr class="t"><td>Rémunération brute</td><td class="n">${eur2(b.gross)}</td></tr>` : ''}
+    <tr><td>Commission L’ArtBoristerie${comPct ? ` (${esc(pct(comPct))})` : ''}</td><td class="n">− ${eur2(commissionAmount(s))}</td></tr>
+    ${cst ? cst.transfers.map(t => `<tr><td class="m">dont transféré le ${esc(fmtDate(t.transferred_at))}${t.note ? ' · ' + esc(t.note) : ''}</td><td class="n m">${eur2(Number(t.amount))}</td></tr>`).join('')
+      + (cst.legacy ? `<tr><td class="m">transférée le ${esc(fmtDate(com.paid_at))}</td><td class="n m">${eur2(cst.total)}</td></tr>` : '')
+      + (cst.remaining >= 0.005 && !cst.legacy ? `<tr><td class="m">reste à transférer (pas encore prélevé sur ton compte)</td><td class="n m">${eur2(cst.remaining)}</td></tr>` : '') : ''}
   </tbody></table>
 
   <h2>Les dépenses de la date</h2>
@@ -50,15 +58,17 @@ export function exportArtistBudget(showId){
 
   <h2>Le résultat</h2>
   <table><tbody>
-    <tr class="big"><td><b>Reste pour ${esc(who)}</b><div class="m">cachet − commission − dépenses</div></td><td class="n"><b>${eur2(r.reste)}</b></td></tr>
+    <tr class="big"><td><b>Reste pour ${esc(who)}</b><div class="m">${b.share ? 'MG + part du résultat' : 'cachet'} − commission − dépenses</div></td><td class="n"><b>${eur2(r.reste)}</b></td></tr>
+    ${unknown.length ? `<tr><td colspan="2"><b>${esc(missingCostText(unknown))}</b><div class="m">ces coûts ne sont pas encore comptés : le reste n’est pas définitif</div></td></tr>` : ''}
     ${paid.map(l => `<tr><td>Versé${l.paid_at ? ' le ' + esc(fmtDate(l.paid_at)) : ''}${l.supplier ? ' à ' + esc(l.supplier) : ''}</td><td class="n">${eur2(l.amount)}</td></tr>`).join('')
       || (todo.length ? '' : `<tr><td class="m" colspan="2">Versement pas encore effectué.</td></tr>`)}
     ${todo.map(l => `<tr><td>À verser${l.supplier ? ' à ' + esc(l.supplier) : ''}</td><td class="n">${eur2(l.amount)}</td></tr>`).join('')}
   </tbody></table>
   ${exp.some(l => l.amount == null) ? '<p class="m">« (prévu) » : montant estimé, la pièce n’est pas encore arrivée.</p>' : ''}
-  <footer>L’ArtBoristerie Productions · établi le ${esc(fmtDate(new Date().toLocaleDateString('sv-SE')))}</footer>
+  <footer>L’ArtBoristerie Productions · établi le ${esc(fmtDate(today()))}</footer>
 </main></body></html>`;
   const w = window.open('', '_blank');
-  if (!w) return alert('Autorise les fenêtres pop-up pour exporter le budget.');
+  if (!w) return toast('Autorise les fenêtres pop-up pour exporter le budget (icône dans la barre d’adresse), puis recommence.', true);
   w.document.open(); w.document.write(html); w.document.close();
+  w.document.getElementById?.('print-btn')?.addEventListener('click', () => w.print());   // pas de gestionnaire en ligne (politique de sécurité, v1.47)
 }

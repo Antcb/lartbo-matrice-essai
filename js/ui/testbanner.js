@@ -7,7 +7,7 @@
  */
 import { APP_VERSION, ENV, PUBLIC_PAGE } from '../config.js';
 
-export const ESSAI_NOTICE = `SITE D’ESSAI C1 · version ${APP_VERSION} · base de TEST « Lartbo-matrice-test » (dthfocplfzzmkgaxhmwk) · la production n’est pas accessible depuis ce site.`;
+export const ESSAI_NOTICE = `SITE D’ESSAI CALENDRIERS · version ${APP_VERSION} · base de TEST « Lartbo-matrice-test » (dthfocplfzzmkgaxhmwk) · la production n’est pas accessible depuis ce site.`;
 export const TEST_APP_NOTICE = ESSAI_NOTICE + ' Espace de test : base séparée de la vraie Matrice ; les liens créés ici portent la mention « test ». N’envoie ni lien ni mail à un vrai contact depuis cet espace.';
 export const TEST_PAGE_NOTICE = ESSAI_NOTICE + ' Page de test : les réponses vont dans l’espace de test de la Matrice, pas dans la vraie.';
 

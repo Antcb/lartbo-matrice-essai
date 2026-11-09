@@ -4,13 +4,15 @@
  */
 import { importMovinmotion } from './views/employees.js';
 import { render } from './app.js';
-import { insert, save, sb, uploadFiles } from './data.js';
+import { insert, save, sb, syncLinks, uploadFiles } from './data.js';
 import { geocode } from './geo.js';
-import { byId, projIds } from './selectors.js';
-import { S, localSet, setProjects } from './state.js';
-import { parseCSV, toast, today } from './utils.js';
+import { setSuiviPlace } from './prospection.js';
+import { byId, linksOfContact, projIds } from './selectors.js';
+import { S, localSet, setProjects, touch } from './state.js';
+import { MAIL_MSG, fieldError, mailOk, parseCSV, toast, today } from './utils.js';
 import { setLogDraft } from './views/suivi.js';
 import { clearDraft } from './ui/drafts.js';
+import { fileDrag, takeDropped } from './ui/dropfiles.js';
 
 // + Projet sur un suivi / une tâche
 document.addEventListener('change', async e => {
@@ -71,7 +73,7 @@ document.addEventListener('submit', async e => {
 // Pièces jointes : bouton « Ajouter un fichier »
 document.addEventListener('change', async e => {
   const t = e.target;
-  if (t.dataset?.filelist){ showPicked(t); return; }
+  if (t.dataset?.filelist){ keepPicked(t); showPicked(t); return; }
   if (!t.dataset?.uploadOwner) return;
   const files = [...t.files]; if (!files.length) return;
   await uploadFiles(JSON.parse(t.dataset.uploadOwner), files);
@@ -80,15 +82,19 @@ document.addEventListener('change', async e => {
 
 // Pièces jointes : glisser-déposer
 const zoneOf = e => e.target.closest?.('[data-drop],[data-drop-form]');
+// (v1.60.2) même lecture que la fenêtre des mails : glisser depuis Mail (Mac) accepté même sans « Files » annoncé,
+// fichiers lus aussi dans les éléments du dépôt, et un message quand rien n'est exploitable au lieu de ne rien faire
 ['dragenter','dragover'].forEach(ev => document.addEventListener(ev, e => {
-  const z = zoneOf(e); if (!z || !e.dataTransfer?.types?.includes('Files')) return;
+  const z = zoneOf(e); if (!z || !fileDrag(e)) return;
   e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; z.classList.add('over');
 }));
 document.addEventListener('dragleave', e => { const z = zoneOf(e); if (z && !z.contains(e.relatedTarget)) z.classList.remove('over'); });
 document.addEventListener('drop', async e => {
   const z = zoneOf(e); if (!z) { if (e.dataTransfer?.types?.includes('Files')) e.preventDefault(); return; }
   e.preventDefault(); z.classList.remove('over');
-  const files = [...(e.dataTransfer?.files || [])]; if (!files.length) return;
+  // (v1.60.3) lecture et copie en mémoire DANS l'événement : un message glissé depuis Apple Mail est un .eml temporaire
+  // que Mail efface ou réécrit ensuite (l'envoi répondait alors « Failed to fetch ») ; message clair si rien n'est lisible
+  const {files} = await takeDropped(e); if (!files.length) return;
   if (z.dataset.dropForm){
     // dans un formulaire : on ajoute les fichiers au champ, envoyés à l'enregistrement
     const input = z.querySelector('input[type=file]'); const dt = new DataTransfer();
@@ -110,10 +116,38 @@ document.addEventListener('change', async e => {
   await save('projects', p.id, {[f]: list});
 });
 
+// Rattacher un contact existant à une structure (v1.54) : un lien de plus, sans déplacer ni copier le contact
+document.addEventListener('change', async e => {
+  const t = e.target; if (!t.dataset?.attachContact || !t.value) return;
+  const sid = t.dataset.attachContact, cid = t.value, c = byId('contacts', cid); t.value = '';
+  if (!c) return;
+  if (S.db.contact_structures.some(l => l.contact_id === cid && l.structure_id === sid)){ toast(`${c.display_name} est déjà rattaché(e) à cette structure`); return render(); }
+  const ids = [...new Set([...linksOfContact(cid).map(x => x.id), sid])];
+  await syncLinks('contact', cid, ids);
+  const others = linksOfContact(cid).filter(x => x.id !== sid);
+  toast(`${c.display_name} rattaché(e)${others.length ? ` (reste aussi lié(e) à ${others.map(x => x.name).join(', ')})` : ''}`);
+  render();
+});
+// Fonction d'un contact dans une structure (contact_structures.role, v1.54 ; corrections du 05/11/2026) : enregistrement EXPLICITE
+// seulement (bouton « Enregistrer » ou Entrée) ; la perte du focus n'enregistre jamais rien (Tab vers « Annuler », geste interrompu…) ;
+// Échap annule. Aucun état caché : l'édition se termine par Enregistrer ou Annuler, rien d'autre.
+document.addEventListener('keydown', e => {
+  const t = e.target; if (!t.dataset?.linkRole) return;
+  if (e.key === 'Enter'){ e.preventDefault();
+    // juste après un avertissement « modifiée ailleurs » : une Entrée réflexe (ou maintenue) ne remplace pas la valeur de l'autre poste
+    if (e.repeat || (S.editRoleWarn && Date.now() - S.editRoleWarn < 1500)) return;
+    t.closest('.role-edit')?.querySelector('[data-act=saveLinkRole]')?.click(); }
+  else if (e.key === 'Escape'){ e.preventDefault(); S.editRole = null; S.editRoleDraft = null; S.editRoleBase = null; S.editRoleWarn = false; render(); }
+});
+// saisie en cours gardée en mémoire (jamais enregistrée) : un réaffichage automatique (temps réel, autre action) ne la perd pas
+document.addEventListener('input', e => { if (e.target.dataset?.linkRole) S.editRoleDraft = e.target.value; });
+
 // Coordonnées administratives d'une structure (champ JSON « admin »)
 document.addEventListener('change', async e => {
   const t = e.target; if (!t.dataset?.admin) return;
   const st = byId('structures', t.dataset.sid);
+  // mail au mauvais format : message sous le champ, rien n'est enregistré (Q23, comme les cases des tableaux)
+  if (/(^|_)email(_\d)?$/.test(t.dataset.admin)){ if (!mailOk(t.value)){ fieldError(t, MAIL_MSG); t.focus(); return; } fieldError(t, ''); }
   await save('structures', st.id, {admin: {...(st.admin||{}), [t.dataset.admin]: t.value.trim()}}, {rerender:false});
   toast('Enregistré');
 });
@@ -141,7 +175,26 @@ document.addEventListener('change', async e => {
   toast('Date rattachée au suivi');
 });
 
+// Lieu d'un suivi (v1.60.2) : lieu connu ou adresse choisis dans la liste → lieu complet (adresse, code postal, ville, département,
+// coordonnées) ; nom tapé sans choisir → gardé tel quel, sans coordonnées inventées ; champ vidé → lieu retiré
+document.addEventListener('ac-chosen', e => { const v = e.target.querySelector?.('.ac-val[data-suivi-lieu]'); if (v) v._chosen = e.detail; });
+document.addEventListener('change', async e => {
+  const pid = e.target.dataset?.suiviLieu; if (!pid) return;
+  const el = e.target;
+  await Promise.resolve();   // le choix dans la liste (ac-chosen) est signalé juste après le « change »
+  const it = el._chosen; el._chosen = null;
+  const typed = el.value.trim();
+  await setSuiviPlace(pid, it ? {venue: it.venue ?? null, address: it.street || null, postal_code: it.postcode || null, city: it.city || null,
+      department: it.department_code || (it.country && !/^france$/i.test(it.country) ? (it.country_code || it.country) : null), lat: it.lat ?? null, lng: it.lng ?? null}
+    : typed ? {venue: typed} : null);
+});
 
+/** Fichiers choisis en plusieurs fois (bouton puis bouton, ou bouton puis glisser) : les premiers sont gardés, sans doublon (v1.53) */
+const fileKey = f => `${f.name}|${f.size}|${f.lastModified}`;
+function keepPicked(input){
+  const seen = new Set(), all = [...(input._kept || []), ...input.files].filter(f => { const k = fileKey(f); if (seen.has(k)) return false; seen.add(k); return true; });
+  const dt = new DataTransfer(); all.forEach(f => dt.items.add(f)); input.files = dt.files; input._kept = all;
+}
 /** Fichiers choisis dans un formulaire (pas encore envoyés) : liste avec ✕ pour en retirer un */
 function showPicked(input){
   const el = document.getElementById('fl-'+input.dataset.filelist); if (!el) return;
@@ -153,7 +206,7 @@ document.addEventListener('click', e => {
   e.preventDefault(); e.stopPropagation();
   const input = document.querySelector(`input[data-filelist="${b.dataset.rmpick}"]`); if (!input) return;
   const dt = new DataTransfer(); [...input.files].forEach((f,i) => { if (i !== Number(b.dataset.i)) dt.items.add(f); });
-  input.files = dt.files; showPicked(input);
+  input.files = dt.files; input._kept = [...input.files]; showPicked(input);
 }, true);
 
 // Brouillon des notes d'échange : enregistré à chaque frappe

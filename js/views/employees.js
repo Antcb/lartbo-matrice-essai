@@ -12,6 +12,7 @@ import { byId, linkLabel, publicLink, setting } from '../selectors.js';
 import { S } from '../state.js';
 import { viewHead } from '../ui/bits.js';
 import { openModal } from '../ui/modal.js';
+import { copyText } from '../ui/dialog.js';
 import { esc, fmtDate, matches, norm, parseCSV, toast, today } from '../utils.js';
 
 const REQ = RH_FIELDS.filter(f => f.req);
@@ -36,7 +37,7 @@ export function viewEmployees(){
       const filled = REQ.filter(f => val(e, f)).length, kinds = docKinds(e);
       return `<tr class="${e.active ? '' : 'muted'} click" data-act="openEmployee" data-id="${e.id}">
         <td><b>${esc(fullName(e) || 'Sans nom')}</b></td><td>${esc(e.role || '')}</td><td>${esc(e.email || '')}</td><td class="nowrap">${esc(e.phone || '')}</td>
-        <td><span class="${filled === REQ.length ? 'ok-badge' : 'warn-badge'}">${filled}/${REQ.length}</span>${e.form_submitted_at ? ` <span class="muted" title="Questionnaire rempli">✓ ${fmtDate(e.form_submitted_at.slice(0,10))}</span>` : e.form_sent_at ? ' <span class="muted">questionnaire envoyé</span>' : ''}</td>
+        <td><span class="${filled === REQ.length ? 'ok-badge' : 'warn-badge'}">${filled}/${REQ.length}</span>${e.form_submitted_at ? ` <span class="muted" title="Questionnaire rempli">✓ ${fmtDate(e.form_submitted_at)}</span>` : e.form_sent_at ? ' <span class="muted">questionnaire envoyé</span>' : ''}</td>
         <td class="nowrap">${RH_DOCS.filter(d => d[2]).map(([k, l]) => `<span class="doc-chip ${kinds.has(k) ? 'on' : ''}" title="${esc(l)}">${esc(l)}</span>`).join(' ')}${pending(e) ? ` <span class="warn-badge">${pending(e)} à ranger</span>` : ''}</td>
         <td>${e.drive_folder_id ? `<a href="https://drive.google.com/drive/folders/${esc(e.drive_folder_id)}" target="_blank" rel="noopener" data-stop="1">Dossier</a>` : '<span class="muted">—</span>'}</td></tr>`;
     }).join('') || '<tr><td colspan="7" class="empty">Aucun salarié.</td></tr>'}
@@ -59,7 +60,7 @@ export function editEmployee(id){
   const mm = e.info?.movinmotion || {};
   const extra = id ? `<div class="mail-wrap emp-extra">
     <h3 class="block-title">Infos complémentaires</h3>
-    <p class="help">La fiche se remplit avec l’export Movinmotion. Pour le reste (permis, cartes SNCF / Flying Blue…), envoie-lui son lien : il remplit depuis son téléphone, tout arrive ici et ses pièces sont rangées dans son dossier Drive. ${e.form_submitted_at ? `Répondu le ${fmtDate(e.form_submitted_at.slice(0,10))}.` : e.form_sent_at ? `Envoyé le ${fmtDate(e.form_sent_at.slice(0,10))}.` : ''}</p>
+    <p class="help">La fiche se remplit avec l’export Movinmotion. Pour le reste (permis, cartes SNCF / Flying Blue…), envoie-lui son lien : il remplit depuis son téléphone, tout arrive ici et ses pièces sont rangées dans son dossier Drive. ${e.form_submitted_at ? `Répondu le ${fmtDate(e.form_submitted_at)}.` : e.form_sent_at ? `Envoyé le ${fmtDate(e.form_sent_at)}.` : ''}</p>
     <div class="vh-actions"><button type="button" class="btn sm primary" data-act="rhSendForm" data-part="extra" data-id="${e.id}">Préparer le mail</button>
       <button type="button" class="btn sm" data-act="rhCopyLink" data-part="extra" data-id="${e.id}">Copier le lien</button>
       <button type="button" class="btn sm ghost" data-act="rhSheet" data-id="${e.id}">Créer la fiche RH (Google Sheet)</button></div>
@@ -76,6 +77,8 @@ export function editEmployee(id){
     ${Object.keys(mm).length ? `<details class="mt"><summary>Données de l’export Movinmotion (${Object.keys(mm).length})</summary><dl class="fiche-dl mt-sm">${Object.entries(mm).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl></details>` : ''}
   </div>` : '';
   return openModal({title: id ? fullName(e) || 'Salarié' : 'Nouveau salarié', wide: true, fields, values, extraTop: extra,
+    deleteAsk: () => ({title: 'Supprimer le salarié ?', text: `Supprimer la fiche de « ${fullName(e)} » de la Matrice ? Ses lignes de budget (Staff) et sa place dans l’équipe d’un artiste restent, sans lien vers lui. Son dossier et ses fichiers Google Drive ne sont pas touchés.`,
+      actions: [{value: 'del', label: 'Supprimer la fiche', danger: true}]}),
     onDelete: id ? () => remove('employees', id) : null,
     onSave: async v => {
       const row = {active: !!v.active, info: {...(e.info || {})}, updated_at: new Date().toISOString()};
@@ -94,7 +97,7 @@ function docsHTML(e){
   const missing = RH_DOCS.filter(([k,, req]) => req && !kinds.has(k)).map(d => d[1]);
   return `${missing.length ? `<p class="err mb-sm">Manque : ${missing.map(esc).join(', ')}</p>` : ''}
     ${docs.length ? `<ul class="doc-list">${docs.map(d => `<li>${d.file_id ? `<a href="https://drive.google.com/file/d/${esc(d.file_id)}/view" target="_blank" rel="noopener">${esc(d.drive_name || d.target || d.name)}</a>` : `<span>${esc(d.target || d.label || d.kind)} <span class="muted">(${esc(d.name)})</span></span> <span class="warn-badge">à ranger</span>`}
-      <span class="muted">${d.at ? fmtDate(d.at.slice(0,10)) : ''}</span></li>`).join('')}</ul>` : '<p class="muted">Aucune pièce pour l’instant.</p>'}`;
+      <span class="muted">${d.at ? fmtDate(d.at) : ''}</span></li>`).join('')}</ul>` : '<p class="muted">Aucune pièce pour l’instant.</p>'}`;
 }
 
 // ─────────────── Actions ───────────────
@@ -106,7 +109,7 @@ export const EMP_ACTIONS = {
   openEmployee: (t, ev) => { if (ev.target.closest('[data-stop]')) return; editEmployee(t.dataset.id); },
   toggleInactiveEmployees: () => { S.showInactiveEmployees = !S.showInactiveEmployees; render(); },
   rhCopyLink: async t => { const link = formLink(byId('employees', t.dataset.id), t.dataset.part);
-    try { await navigator.clipboard.writeText(link); toast(linkLabel('Lien du questionnaire copié')); } catch { prompt(linkLabel('Lien du questionnaire') + ' :', link); } },
+    await copyText(link, linkLabel('Lien du questionnaire copié'), linkLabel('Lien du questionnaire')); },
   rhSendForm: async t => {
     const e = byId('employees', t.dataset.id);
     if (!e.email) return toast('Ajoute d’abord son mail', true);

@@ -20,6 +20,10 @@ export const stClass = s => !s ? 'book' : s.startsWith('Intérêt') ? 'int' : s.
 export const isOff = s => s==='Annulée' || s==='Sans Suite';
 
 export const CONFIRMED_PROD = ['Confirmée Salle','Confirmée Festival'];
+/** Dates qui ne passent pas par L'ArtBoristerie (« Option Artiste », « Confirmée Artiste ») : visibles partout dans le planning,
+ *  jamais comptées dans ses finances (décision d'Anthony du 01/11/2026, v1.53) */
+export const ARTIST_ONLY = ['Option Artiste','Confirmée Artiste'];
+export const viaArtbo = s => !ARTIST_ONLY.includes(s?.status);
 
 export const CONTRACTS = ['Cession','Co-Réalisation','Production','Co-Production','N.C'];
 
@@ -48,9 +52,9 @@ export const TEAM_NAMES = {'anthony@lartboristerie.com':'Anthony', 'production@l
 // Budget d'une date : catégories de dépenses (l'Excel : Technical, VHR, Promoting, Hospitality, Taxes, Others, Staff, Movinmotion, Fees)
 export const BUDGET_CATS = ['Technique','VHR','Promo','Accueil','Taxes','Autres','Staff','Movinmotion','Solde artiste','Salle','Promoteur'];
 // Qui paie / qui reçoit l'argent
-export const PAYERS = ['compte','artbo','artiste','organisateur','autre'];
+export const PAYERS = ['compte','artbo','artiste','organisateur','partenaire','autre'];   // partenaire : coproducteur (v1.51)
 
-export const PAY_KINDS = {acompte:'Acompte', solde:'Solde', artbo:"Commission L'ArtBo", partner:'Commission partenaire', cnm:'Taxe CNM', autre:'Autre'};
+export const PAY_KINDS = {acompte:'Acompte', solde:'Solde', artbo:"Commission L'ArtBo", partner:'Commission partenaire', cnm:'Taxe CNM (historique)', autre:'Autre'};   // v1.51 : plus de nouvelle ligne CNM en facturation (calculée dans le budget)
 
 // Suivi admin d'une date en production complète
 export const PROD_STEPS = [
@@ -59,6 +63,7 @@ export const PROD_STEPS = [
   ['contract_sent','Contrat envoyé'],
   ['contract_signed','Contrat signé'],
   ['contract_cosigned_sent','Contrat co-signé renvoyé'],
+  ['boucle_com','Boucle communication'],   // même donnée que l'onglet Communication (v1.60.3, demande d'Anthony du 07/11/2026)
   ['boucle_tech','Boucle technique'],
 ];
 // Projets en « booking seul » : L'ArtBo envoie la conf, puis facture sa commission à l'artiste
@@ -66,6 +71,17 @@ export const BOOKING_STEPS = [
   ['conf_kit_sent','Conf + FT + kit promo'],
   ['contract_cosigned_sent','Contrat co-signé (artiste ↔ organisateur)'],
 ];
+/**
+ * Dates de suivi d'une date de concert, saisies à la main dans Production › Suivi admin et dans Communication (v1.60.3) :
+ * une date déjà renseignée ne se modifie ni ne s'efface sans confirmation (ACTIONS['change:shows.<champ>'], js/actions.js).
+ */
+export const FOLLOW_DATES = {
+  conf_kit_sent: 'Conf + FT + kit promo', precontract_done: 'Pré-contrat complété', contract_sent: 'Contrat envoyé',
+  contract_signed: 'Contrat signé', contract_cosigned_sent: 'Contrat co-signé', boucle_com: 'Boucle communication',
+  boucle_tech: 'Boucle technique', poster_request_date: 'Demande d’affiches',
+};
+/** Dates d'une ligne de facture saisies à la main (Production › Factures) : même confirmation (v1.60.3, décision d'Anthony du 07/11/2026) */
+export const INVOICE_DATES = { sent_at: 'Envoyée', reminded_at: 'Relancée', paid_at: 'Payée' };
 
 export const VIEWS = [
   ['todo','To Do'], ['booking','Booking'], ['prospects','Suivi'], ['production','Production'], ['ticketing','Ticketing'], ['communication','Communication'],

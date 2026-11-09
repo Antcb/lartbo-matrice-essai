@@ -20,7 +20,7 @@
   /* hauteurs communes : champ et bouton (36), champ dans un tableau (32), petit bouton (28), pastille (26) */
   --fs-h1:34px; --fs-h2:22px; --fs-h3:18px;
   --sp-1:6px; --sp-2:12px; --sp-3:18px;
-  --h:36px; --h-sm:32px; --h-xs:28px; --h-pill:26px;
+  --h:36px; --h-sm:32px; --h-xs:28px; --h-pill:26px; --h-touch:40px; --chk-touch:20px;   /* cible tactile minimale, case à cocher au doigt (DS §11.1) */
   --chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%235B677D'/%3E%3C/svg%3E");
 }
 
@@ -84,6 +84,7 @@ main{padding:20px 24px 60px;max-width:1560px;margin:0 auto}
 .view-head{margin:4px 0 18px}
 .vh-top{display:flex;align-items:center;gap:12px 16px;flex-wrap:wrap}
 .vh-filters{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;margin-top:14px}
+.artist-ctx{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap;font-size:13px;color:var(--muted);margin:var(--sp-2) 0 0}
 .vh-title{display:flex;align-items:baseline;gap:4px 14px;flex-wrap:wrap;flex:1 1 260px;min-width:0}
 .view-head h1{font-size:var(--fs-h1)}
 .view-head .sub{color:var(--muted)}
@@ -195,7 +196,7 @@ td input:not([type=checkbox]):not([type=radio]):not(.dt-txt):not(.dt-val):not(.t
 .cell-ta.is-url{min-width:180px;font-size:13px;overflow-wrap:anywhere;color:var(--brand-2)}
 td input:hover,td select:hover,td textarea:hover,.cell-ta:hover{border-color:var(--line)}
 td input:focus,td select:focus,td textarea:focus,.cell-ta:focus{border-color:var(--brand-2);background:var(--panel);outline:none}
-td :is(input[type=number],input.num-in){text-align:right;width:90px}
+td :is(input[type=number],input.num-in){text-align:right;width:calc(10ch + 20px)}   /* un montant à 7 chiffres et ses centimes (1234567,89) lisible en entier, quelle que soit la police (relecture V1.56) */
 td :is(input[type=number],input.num-in).narrow{width:72px}
 td input[type=checkbox]{width:16px;height:16px;accent-color:var(--brand)}
 /* chiffres sans flèches +/- (partout) */
@@ -213,6 +214,7 @@ td.num > :is(input,.dt){margin-right:-9px}
 /* Date : saisie au clavier + calendrier */
 .dt{display:inline-flex;align-items:center;position:relative;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--panel);height:var(--h-sm)}
 td .dt{border-color:transparent;background:transparent}
+@media (min-width:1025px){ .prod-bill td :is(input[type=number],input.num-in).narrow{width:calc(5ch + 20px)} }   /* factures sur ordinateur : % et TVA (« 33,33 » au plus) plus étroits ; dates de tableau inchangées (96 px, entières dans toutes les polices — relecture V1.56.1) */
 td .dt:hover{border-color:var(--line)}
 .dt:focus-within{border-color:var(--brand-2);background:var(--panel)}
 .dt-txt{border:0!important;background:transparent!important;width:96px;padding:0 0 0 8px!important;font-variant-numeric:tabular-nums;outline:none;height:100%}
@@ -290,6 +292,7 @@ td .ac-input:hover{border-color:var(--line)}
 /* 10 — Production ------------------------------------------------------ */
 .prod-list{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow);overflow:hidden}
 .prod-row+.prod-row{border-top:1px solid var(--line-2)}
+.prod-row{scroll-margin-top:90px}   /* date ouverte depuis la fiche projet ou une notification : visible sous l'en-tête fixe (v1.60.3) */
 .prod-head{display:grid;grid-template-columns:56px minmax(0,1fr) auto auto 20px;gap:16px;align-items:center;padding:10px 16px;cursor:pointer}
 .prod-head:hover{background:var(--soft)}
 .prod-head .what b{font-size:15px}
@@ -354,6 +357,12 @@ td .ac-input:hover{border-color:var(--line)}
 .facts small{color:var(--muted);font-size:12px}
 .contact-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 12px;padding:8px 0;border-top:1px solid var(--line-2);font-size:14px}
 .contact-row:first-of-type{border-top:0}
+.contact-row .link-role{height:var(--h-sm);min-width:0;max-width:220px;font-size:13px}   /* fonction dans cette structure (v1.54) */
+.contact-row :is(.role-view,.role-edit){display:inline-flex;align-items:center;flex-wrap:wrap;gap:4px 8px;justify-self:end;text-align:right}
+@media (max-width:760px){ .contact-row :is(.role-view,.role-edit){grid-column:1/-1;justify-self:start;text-align:left} }   /* téléphone : fonction sous le nom, pleine largeur */
+@media (pointer:coarse){ #main .contact-row :is(.role-view,.role-edit) :is(.btn,.link-role){height:auto;min-height:var(--h-touch)} }   /* fonction dans une structure : cibles de 40 px au doigt (DS §11.1) ; #main comme les règles téléphone, sinon 28 px l'emporte */
+.contact-row .role-edit .warn-txt{flex-basis:100%}   /* « modifiée ailleurs » : sur sa propre ligne, sous le champ */
+.attach-contact .ac{width:100%;max-width:420px}
 .contact-row .links{display:flex;flex-wrap:wrap;gap:4px 12px;grid-column:1/-1;font-size:13px}
 .admin-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px 18px}
 
@@ -369,6 +378,11 @@ td .ac-input:hover{border-color:var(--line)}
 .photo.lg{width:150px}
 .project-hero{display:flex;gap:20px;align-items:center;margin-bottom:14px}
 .project-hero h1{font-size:var(--fs-h1)}
+.project-hero .ph-photo{display:flex;flex-direction:column;gap:var(--sp-1);align-items:center}
+.project-hero .ph-main{flex:1;min-width:0}
+/* tablette et téléphone : les boutons passent sous le nom au lieu de le recouvrir (point 16, v1.60.2) ; téléphone : photo réduite comme les cartes (.pcard) */
+@media (max-width:1100px){ .project-hero{flex-wrap:wrap} .project-hero > .vh-actions{flex:1 1 100%} }
+@media (max-width:760px){ .project-hero{gap:var(--sp-2)} .project-hero .photo.lg{width:84px} .project-hero h1{overflow-wrap:anywhere} }
 .cropper{position:relative;width:280px;aspect-ratio:1/1;border-radius:var(--r);overflow:hidden;background:#222;cursor:grab;touch-action:none;margin:0 auto}
 .cropper img{width:100%;height:100%;object-fit:cover;user-select:none;-webkit-user-drag:none;pointer-events:none}
 .link-row{display:grid;grid-template-columns:200px minmax(0,1fr) auto;gap:8px;align-items:center;padding:6px 0;border-top:1px solid var(--line-2)}
@@ -407,6 +421,19 @@ dialog::backdrop{background:rgba(16,24,42,.5)}
 .checks input{width:16px;height:16px;margin:0;accent-color:var(--brand)}
 .modal-foot{display:flex;gap:8px;justify-content:flex-end;padding:14px 20px;border-top:1px solid var(--line-2)}
 .modal-foot .left{margin-right:auto}
+/* fenêtre de dialogue (js/ui/dialog.js, §9.1) : texte en une colonne */
+dialog.ask .modal-body{display:block}
+dialog.ask .modal-body p{margin:0 0 8px}
+/* boutons toujours tous visibles, « Annuler » compris : à la ligne si besoin, empilés sur téléphone (relecture v1.46b) */
+dialog.ask .modal-foot{flex-wrap:wrap}
+dialog.ask textarea.ask-copy{width:100%;font-family:inherit}
+/* message d'erreur sous un champ (§9.1, Q23) : texte et bordure en --danger */
+.field .help.err{color:var(--danger)}
+/* erreur sous une case de tableau ou d'une liste (hors .field) : même message et même bordure (v1.50a, DESIGN_SYSTEM §9) */
+.help.err[data-field-err]{color:var(--danger)}
+td input.invalid,td input.invalid:hover,td input.invalid.invalid:focus,td textarea.invalid,.cell-ta.invalid,.cell-ta.invalid:hover,.cell-ta.invalid.invalid:focus,.al-row input.invalid,.al-cell input.invalid,.vf-table input.invalid{border-color:var(--danger)}
+.field input.bad:not([type=checkbox]):not([type=hidden]):not(.dt-txt):not(.dt-val):not(.ac-input):not(.file-input),.field textarea.bad{border-color:var(--danger)}   /* même poids que la règle des champs, placée après */
+@media (max-width:720px){ dialog.ask .modal-foot{flex-direction:column;align-items:stretch} }
 
 /* Connexion */
 .login{max-width:400px;margin:12vh auto;padding:32px}
@@ -423,7 +450,8 @@ dialog::backdrop{background:rgba(16,24,42,.5)}
 
 /* 17 — Tablette & téléphone -------------------------------------------- */
 @media (max-width:1100px){
-  .booking,.workspace{grid-template-columns:1fr}
+  .booking{grid-template-columns:1fr}
+  .workspace{grid-template-columns:minmax(0,1fr)}   /* fiche de suivi : le contenu ne force plus la largeur (v1.52.1) */
   .side{position:static}
   .map-box{max-width:560px}
   .prod-body,.suivi-grid,.struct-hero{grid-template-columns:1fr}
@@ -463,7 +491,7 @@ dialog::backdrop{background:rgba(16,24,42,.5)}
   .stat-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
   .stat b{font-size:22px}
   .steps{grid-template-columns:1fr auto}
-  .view-settings .steps{grid-template-columns:minmax(0,1fr)} .view-settings .steps label{margin-top:6px}
+  .view-settings .steps,.steps.prod-params{grid-template-columns:minmax(0,1fr)} .view-settings .steps label,.steps.prod-params label{margin-top:6px}   /* paramètres du budget aussi : libellé au-dessus (v1.56) */
   .mini-grid .ac,.mini-grid .ac-input,.mini-grid .cell-ta{width:100%;min-width:0}
   .qty-line{flex-wrap:wrap;justify-content:flex-end}
   .pcard{grid-template-columns:minmax(0,1fr) 84px} .pcard .photo{width:84px}
@@ -475,6 +503,8 @@ dialog::backdrop{background:rgba(16,24,42,.5)}
   .modal-body{max-height:none;flex:1}
   .modal-foot{position:sticky;bottom:0;background:var(--panel)}
   .suivi{padding:12px}
+  .view-prospects .log-head{flex-wrap:wrap}   /* journal : date, interlocuteur et boutons passent à la ligne au lieu de déborder */
+  .view-prospects .btn.icon{flex:none;min-width:var(--h-touch)}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 
@@ -535,6 +565,8 @@ input[type=range]{accent-color:var(--brand);flex:1;min-width:120px}
 .mini-task input[type=checkbox]{width:16px;height:16px;accent-color:var(--brand)}
 .prod-body{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
 .prod-bill{grid-column:1/-1}
+.prod-bill .cell-ta[data-f=invoice_number]{min-width:9ch}   /* remplace un style en ligne (DS §10) */
+@media (min-width:1025px){ .prod-bill :is(th,td){padding-left:var(--sp-1);padding-right:var(--sp-1)} }   /* tableau dense (12 colonnes) : tient à 1 440 px sans défilement */
 /* 18 — Mails, modèles et fiche (v1.10) --------------------------------- */
 .prod-mails{grid-column:1/-1;border-top:1px solid var(--line-2);padding-top:14px}
 .mail-btns{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center}
@@ -574,6 +606,24 @@ input[type=range]{accent-color:var(--brand);flex:1;min-width:120px}
   .tpl-row{grid-template-columns:1fr}
 }
 .mail-wrap{grid-column:1/-1;min-width:0}
+/* destinataires et copies — champ unique (v1.60.3) : cadre .tagpick (étiquettes), pastilles .tp-chip, saisie avec suggestions .ac ;
+   le champ d'adresses lu à l'envoi (.rcpt-src) est masqué derrière les pastilles */
+.rcpt-field{min-width:0}
+.rcpt-field .rcpt-chips{display:contents}
+.rcpt-chip{max-width:100%;overflow-wrap:anywhere;text-align:left}   /* adresses longues sur téléphone */
+.rcpt-chip small{font-weight:400;color:var(--muted)}
+.rcpt-chip.bad{border-color:var(--danger);color:var(--danger)}
+.rcpt-field .ac{flex:1 1 160px;min-width:0}
+.rcpt-field .ac-input{border:0 !important;outline:0;box-shadow:none !important;padding:4px !important;background:transparent !important;width:100%}   /* comme .tp-q */
+.rcpt-field:has(.bad){border-color:var(--danger)}
+.rcpt-field .help.err{flex-basis:100%;margin:0}
+.rcpt-src{display:none !important}
+.mail-to small{align-self:center}
+.mail-grid>label.rcpt-who{font-weight:400}   /* ligne « Interlocuteur » discrète (v1.60.3) */
+.rcpt-propose:empty{display:none}
+dialog.mail .mail-to.rcpt-who{display:flex;flex-wrap:wrap;align-items:center;gap:var(--sp-1)}
+dialog.mail .mail-to.rcpt-who select{width:auto;max-width:100%}
+.rcpt-note{grid-column:1/-1}
 .warn-badge{background:#FFF1D6;color:#8A5A00;border-radius:999px;padding:3px 10px;font-weight:600;font-size:12px}
 .fiche-lbl{font-size:13px;margin-right:4px}
 .vf-table{width:100%;font-size:13px}
@@ -640,7 +690,7 @@ button.add-proj{cursor:pointer}
 .budget-stats{gap:22px}
 .budget-stats .stat b{font-size:22px}
 .budget-table td{vertical-align:middle}
-.budget-table :is(input[type=number],input.num-in){width:96px}
+.budget-table :is(input[type=number],input.num-in){width:calc(10ch + 20px)}
 .budget-table input.narrow{width:54px}
 .budget-table tr.is-paid td{background:#F4FAF6}
 .budget-table tr.budget-over td{background:var(--brand-tint);outline:2px dashed var(--brand-2);outline-offset:-2px}
@@ -697,8 +747,36 @@ dialog.mail .rt-bar{margin-top:2px}
 dialog.mail .mail-preview{flex:1 1 auto;min-height:160px;overflow:auto}
 dialog.mail .help{font-size:12px;margin:0}
 dialog.mail .mode-note{margin:0}
-@media (max-width:900px){ dialog.mail .mail-grid{grid-template-columns:96px minmax(0,1fr)} dialog.mail .mail-grid>.pr-arts,dialog.mail .mail-grid>.mail-to,dialog.mail .mail-grid>.pr-concert{grid-column:auto} }
-@media (max-width:720px){ dialog.mail{height:100dvh} dialog.mail .mail-grid{grid-template-columns:1fr} dialog.mail .mail-preview{min-height:240px} }
+@media (max-width:900px){ dialog.mail .mail-grid{grid-template-columns:96px minmax(0,1fr)} dialog.mail .mail-grid>.pr-arts,dialog.mail .mail-grid>.mail-to,dialog.mail .mail-grid>.pr-concert,dialog.mail .mail-grid>.pr-date{grid-column:auto} }   /* .pr-date : ne force plus 3 colonnes (v1.52.1) */
+/* téléphone (v1.52.1, seuil officiel 760 — remplace l'ancienne règle à 720) : plein écran, une colonne, tout le contenu défile,
+   boutons d'action en bas toujours dans l'écran ; écran tactile : cibles de 40 px (DS §11.1) */
+@media (max-width:760px){
+  dialog.mail,dialog.mail.wide{width:100vw;max-width:100vw;height:100dvh;max-height:100dvh}
+  dialog.mail .modal-head{padding:calc(var(--sp-2) + env(safe-area-inset-top)) var(--sp-2) var(--sp-2)}
+  dialog.mail .modal-head h2{font-size:var(--fs-h3);overflow-wrap:anywhere}
+  dialog.mail .modal-body{overflow:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:var(--sp-2)}
+  dialog.mail .mail-wrap{flex:none}
+  dialog.mail .mail-grid{grid-template-columns:minmax(0,1fr)}
+  dialog.mail .mail-grid>*{grid-column:1/-1;min-width:0}
+  dialog.mail .mail-grid>label{margin-top:var(--sp-1)}
+  dialog.mail .mail-grid select,dialog.mail .mail-grid input:not([type=checkbox]):not(.dt-val),dialog.mail .mail-to select{width:100%;min-width:0;max-width:100%;height:var(--h-touch);padding:0 10px;border:1px solid var(--line);border-radius:var(--r);background-color:var(--panel);color:var(--ink)}   /* 10 px : marge habituelle des champs (.field) */
+  dialog.mail .mail-grid select:disabled{background-color:var(--soft);color:var(--muted)}
+  dialog.mail .rt-bar select,dialog.mail .rt-btn{height:var(--h-touch)}
+  dialog.mail .pr-date,dialog.mail .pr-concert{flex-wrap:wrap}
+  dialog.mail .mail-preview{flex:none;min-height:240px;overflow:visible}   /* 240 px : hauteur déjà retenue pour le téléphone avant la v1.52.1 */
+  dialog.mail .ml-att{display:flex;flex-wrap:wrap;gap:var(--sp-1);align-items:center}
+  dialog.mail .att-chip{max-width:100%;overflow-wrap:anywhere}
+  dialog.mail .modal-foot{flex-wrap:wrap;padding:var(--sp-2) var(--sp-2) calc(var(--sp-2) + env(safe-area-inset-bottom))}
+  dialog.mail .modal-foot .btn{flex:1 1 40%;height:var(--h-touch)}
+  dialog.mail .modal-foot .btn.primary{order:-1;flex-basis:100%}
+}
+@media (pointer:coarse){
+  dialog.mail .btn,dialog.mail .rt-btn,dialog.mail .rt-bar select,dialog.mail .mail-grid select,dialog.mail .mail-grid input:not([type=checkbox]),
+  .view-prospects select,.view-prospects .search{min-height:var(--h-touch)}
+  dialog.mail .pills label,dialog.mail .att-chip,dialog.mail .tag-chip{min-height:var(--h-touch)}
+  dialog.mail .rcpt-rm{min-width:var(--h-touch);min-height:var(--h-touch)}   /* retirer une adresse au doigt (v1.60.3) */
+  dialog.mail input[type=checkbox]{width:var(--chk-touch);height:var(--chk-touch)}
+}
 .log-mail{margin-top:8px;padding:12px 14px;border:1px solid var(--line-2);border-radius:var(--r);background:#fff;color:#000;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;font-size:14px;line-height:1.45;overflow-x:auto;isolation:isolate;contain:paint}
 .log-mail img{max-width:100%;height:auto}
 .draft-bar{grid-column:1/-1;display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:var(--r);background:#FFF1D6;color:#8A5A00;font-size:13px;font-weight:600}
@@ -713,6 +791,7 @@ dialog.mail .mode-note{margin:0}
 .pa-row{display:flex;flex-wrap:wrap;gap:10px 22px;align-items:center}
 .pa-item{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap}
 .pa-item small{font-size:12px}
+.pa-item.pa-stack{flex-direction:column;align-items:flex-start;gap:4px}   /* boucle communication : bouton, statut du mail préparé */
 .pa-item.drive{gap:6px}
 .ok-txt{color:var(--ok);font-weight:600}
 .warn-txt{color:var(--warn);font-weight:600}
@@ -721,11 +800,12 @@ dialog.mail .mode-note{margin:0}
 .prod-tab .prod-budget,.prod-tab .prod-bill{border:0;padding:0;margin:0}
 .tab-intro{margin:0 0 12px;font-size:13px;color:var(--muted);line-height:1.8}
 .tab-intro .btn{margin-left:8px}
-.tbl-wrap:has(>.budget-sum){max-width:760px}
+.tbl-wrap:has(>.budget-sum){max-width:720px}   /* cadre aligné sur le tableau (DS §5, correction 760 → 720) */
+.date-notes-ta{width:100%;min-height:calc(var(--h) * 5);resize:vertical}   /* onglet Notes d'une date (v1.53) */
 .prod-cols{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr);gap:28px}
 @media (max-width:900px){ .prod-cols{grid-template-columns:1fr} }
 /* Budget : prévu / réel / écart */
-.budget-sum{max-width:720px}
+.budget-sum{width:100%}
 .budget-sum td,.budget-sum th{padding:7px 10px}
 .budget-sum .neg{color:var(--danger);font-weight:600}
 .budget-sum .pos{color:var(--ok);font-weight:600}
@@ -743,13 +823,13 @@ dialog.mail .mode-note{margin:0}
 .pp-btn.pp-on{border-color:var(--brand);color:var(--brand);font-weight:600}
 .inactive-tgl{white-space:nowrap}
 /* Fenêtre de mail : destinataire, copie, objet sur toute la largeur */
-dialog.mail .mail-grid>input[id$="-cc"],dialog.mail .mail-grid>input[id$="-subj"]{grid-column:span 3}
+dialog.mail .mail-grid>.rcpt-field,dialog.mail .mail-grid>input[id$="-subj"]{grid-column:span 3}
 dialog.mail .mail-to{grid-template-columns:minmax(200px,1fr) minmax(0,2fr)}
 dialog.mail .mail-grid input{width:100%;min-width:0}
 .ml-from{font-size:13px;align-self:center}
 .ml-att .drop-hint{color:var(--faint);font-size:12px}
 .ml-att.drop-over{outline:2px dashed var(--brand-2);outline-offset:4px;border-radius:var(--r)}
-@media (max-width:900px){ dialog.mail .mail-grid>input[id$="-cc"],dialog.mail .mail-grid>input[id$="-subj"]{grid-column:auto} dialog.mail .mail-to{grid-template-columns:1fr} }
+@media (max-width:900px){ dialog.mail .mail-grid>.rcpt-field,dialog.mail .mail-grid>input[id$="-subj"]{grid-column:auto} dialog.mail .mail-to{grid-template-columns:1fr} }
 .terms-ac input{width:90px !important;flex:none}
 .terms-eur{white-space:nowrap}
 .terms-n select{width:auto;flex:none}
@@ -790,8 +870,8 @@ dialog.mail .mail-grid input{width:100%;min-width:0}
 .tagpick:focus-within{border-color:var(--brand-2);box-shadow:0 0 0 3px rgba(40,60,99,.12)}
 .tp-chips{display:contents}
 .tp-chip{display:inline-flex;align-items:center;gap:4px;padding:3px 4px 3px 9px;border-radius:999px;background:var(--soft);border:1px solid var(--line);font-size:13px;font-weight:600;color:var(--ink)}
-.tp-rm{border:0;background:none;color:var(--muted);font-size:15px;line-height:1;cursor:pointer;padding:0 4px;border-radius:50%}
-.tp-rm:hover{color:var(--danger);background:#fff}
+.tp-rm,.rcpt-rm{border:0;background:none;color:var(--muted);font-size:15px;line-height:1;cursor:pointer;padding:0 4px;border-radius:50%}
+.tp-rm:hover,.rcpt-rm:hover{color:var(--danger);background:#fff}
 .tp-q{flex:1;min-width:110px;border:0 !important;outline:0;box-shadow:none !important;padding:4px !important;background:transparent}
 .tp-sugg{flex-basis:100%;display:flex;flex-wrap:wrap;gap:6px;max-height:180px;overflow:auto;padding:8px 2px 4px;border-top:1px solid var(--line-2);margin-top:2px}
 .tp-opt{border:1px solid var(--line);background:#fff;border-radius:999px;padding:4px 10px;font:inherit;font-size:13px;cursor:pointer}
@@ -818,11 +898,14 @@ dialog.mail .mail-grid input{width:100%;min-width:0}
 .bt-tiers th,.bt-tiers td{padding:4px 0;font-size:14px;border:0;background:none}
 .bt-tiers th{font-size:12px;color:var(--muted);font-weight:600;text-align:left}
 .bt-tiers td input{display:inline-block;margin:0 4px}
+/* tarifs par jauge : le champ suit le texte « jusqu’à » (pas de marge négative d’alignement de colonne, cellules sans marge intérieure) — point 16, v1.60.2 */
+.bt-tiers tbody td > input[data-bt]:not([type=checkbox]):not([type=radio]){margin:0 4px;max-width:none}
 /* Budget : ligne plus compacte */
-.budget-table .qty-line{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+.budget-table .qty-line{display:inline-flex;flex-wrap:wrap;justify-content:flex-end;align-items:center;gap:4px;white-space:nowrap}   /* quantité × coût puis total : le total passe sous la quantité quand la place manque (1 280 px), aligné à droite comme les montants — aucun défilement horizontal du tableau des cachets à 1 280 px et plus (décision d'Anthony du 07/11/2026, v1.60.3) */
+.budget-table .qty-line .qty-mul{display:inline-flex;flex-wrap:wrap;justify-content:flex-end;align-items:center;gap:4px}   /* « quantité × coût » : passe à la ligne en dernier recours seulement (police plus large que Geist, écran étroit) ; le total passe dessous d'abord */
 .budget-table .qty-line .x{color:var(--muted)}
 .budget-table .qty-line b{min-width:76px;text-align:right;font-variant-numeric:tabular-nums}
-.budget-table input.narrow2{width:74px}
+.budget-table input.narrow2{width:calc(7ch + 20px)}   /* prix unitaire « 1234,56 » entier, quelle que soit la police */
 .budget-table input.doc-no{min-width:80px;width:110px}
 .budget-table tr.has-doc td{background:#FFF9EC}
 .budget-table .calc-note{font-size:11px;margin-top:2px}
@@ -830,6 +913,7 @@ dialog.mail .mail-grid input{width:100%;min-width:0}
 .budget-table td > select{max-width:170px!important}
 .budget-table .dt{max-width:140px}
 .budget-table td{padding-left:8px;padding-right:8px}
+@media (min-width:1025px){ .budget-table td.bl-label{width:30ch} .budget-table td.bl-sup .cell-ta,.budget-table .cell-ta[data-f=doc_number]{min-width:90px} .budget-table :is(th,td){padding-left:var(--sp-1);padding-right:var(--sp-1)} }   /* ordinateur (v1.60.3) : libellé des cachets (jauge, brut indicatif) sur 3 lignes au plus au lieu de 4 à 7 — largeur fixée (width, et non min-width) : la place libre va d'abord à « Prévu HT », pour garder « quantité × coût » sur une ligne ; la place vient du fournisseur (« Salarié »), du n° de pièce et d'un tableau dense (comme .prod-bill) : aucun défilement à 1 280 et 1 440 px (total de « quantité × coût » replié, .qty-line) ; téléphone et tablette : fiches inchangées */
 /* To Do : échéance + urgence dans la même case, structure + date dans « Lié à » */
 .due-cell{min-width:150px}
 .due-cell .urg{display:inline-block;margin-top:4px;margin-left:-9px}
@@ -857,6 +941,7 @@ dialog.mail .mail-grid input{width:100%;min-width:0}
   table.cards .cell-ta{text-align:left}
   table.cards td input,table.cards td select,table.cards .ac-input{border-color:var(--line)}
   table.cards .dt{border-color:var(--line)}
+  table.cards td :is(input[type=number],input.num-in):not(.narrow,.narrow2){width:min(100%,160px)}   /* montants entiers lisibles sur téléphone */
   table.cards .proj-chips{justify-content:flex-end}
   table.cards td > :is(input,select,.dt,.ac,textarea),table.cards .task-title .cell-ta,table.cards .due-cell .urg{margin-left:0!important;margin-right:0!important}
   /* case à cocher (tâche faite…) : en haut à droite de la fiche */
@@ -874,6 +959,8 @@ dialog.mail .mail-grid input{width:100%;min-width:0}
   #main .badge{white-space:normal;height:auto;text-align:left}
   #main .btn{white-space:normal;height:auto;min-height:var(--h);text-align:left}
   #main .btn.sm{min-height:var(--h-xs)}
+  /* Suivi au doigt (v1.52.1, DS §11.1) : même sélecteur #main que ci-dessus, sinon la hauteur minimale de 28 / 36 px l'emporte */
+  @media (pointer:coarse){ #main.view-prospects .btn{min-height:var(--h-touch)} }
   .secret-line{flex-wrap:wrap}
   .tabs,.subtabs{-webkit-mask-image:linear-gradient(90deg,#000 calc(100% - 28px),transparent);mask-image:linear-gradient(90deg,#000 calc(100% - 28px),transparent)}
 }
@@ -884,3 +971,16 @@ dialog.mail .mail-grid input{width:100%;min-width:0}
 /* Budget : intertitre de catégorie (lignes rangées par catégorie) */
 .budget-table tr.cat-row td{background:var(--soft);font-size:13px;padding-top:9px;padding-bottom:7px;border-top:1px solid var(--line)}
 .budget-table tr.just-added td{background:#E8ECF3!important;transition:background .6s}
+/* v1.51 : coréalisation, taxe CNM, clôture d'une coproduction */
+.warn-list{margin:var(--sp-1) 0 var(--sp-2);padding-left:var(--sp-3)}   /* couleur : .warn-txt */
+.lock-set{border:0;margin:0;padding:0;min-width:0}
+.corea-block,.coprod-block{margin-top:var(--sp-3)}
+.cnm-block{margin:var(--sp-2) 0}
+/* Agendas Google des artistes (lecture seule) */
+.gig.cal-unav{--c:var(--muted);background:var(--soft);border-style:dashed;cursor:default}
+.gig.cal-unav .what b{color:var(--muted)}
+.cal-legend{display:flex;flex-direction:column;gap:var(--sp-1);font-size:12px;margin:var(--sp-1) 0}
+.cal-dot{display:inline-block;width:12px;height:12px;border-radius:50%;border:2px dashed var(--brand);background:var(--panel);vertical-align:middle}
+.cal-panel{display:flex;flex-direction:column;gap:var(--sp-1)}
+.cal-actions{display:flex;flex-wrap:wrap;gap:var(--sp-1)}
+.steps-list{margin:0 0 var(--sp-2);padding-left:var(--sp-3)}

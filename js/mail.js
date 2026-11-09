@@ -6,14 +6,16 @@
  * Le brouillon est créé dans Gmail (compte production@) par le script Apps Script
  * (réglage drive_webhook_url) ; sans lui, on copie le mail pour le coller dans Gmail.
  */
-import { billPct } from './calc.js';
+import { confirmAsk } from './ui/dialog.js';
+import { billPct, isCoproduction, paymentsOf, vatConflict } from './calc.js';
 import { ENV } from './config.js';
-import { insert, remove, save, sb } from './data.js';
+import { contentTypeOf, insert, remove, save, sb, typedFile } from './data.js';
 import { byId, contactMails, linksOfStructure, projectOptions, setting } from './selectors.js';
 import { S } from './state.js';
 import { openModal } from './ui/modal.js';
 import { rtStyle, rtToolbar, wrapMail } from './ui/richtext.js';
-import { esc, fmtDate, toast, today } from './utils.js';
+import { recipientsField, syncChips } from './ui/recipients.js';
+import { esc, fmtDate, toast, today, eur2, pct } from './utils.js';
 
 export const MAIL_KINDS = { confirmation: 'Confirmation', boucle_tech: 'Boucle accueil & technique', boucle_com: 'Boucle communication', prospection: 'Prospection', relance: 'Relance de prospection', autre: 'Autre' };
 /** Mails envoyés depuis une structure (pas depuis une date) : balises de la structure */
@@ -77,13 +79,37 @@ export async function mailVars(showId, contactId){
 
 const scriptUrl = () => (setting('drive_webhook_url') || '').trim();
 
+/** Délivrabilité (lot V1.52) — pièces jointes : taille connue des fichiers cochés ; au-delà de ATT_WARN_MB, avertissement avant l'envoi
+ *  (un mail lourd arrive plus souvent en spam ou est refusé ; un lien de partage est souvent préférable). Fichiers Drive : taille inconnue. */
+export const ATT_WARN_MB = 5;
+export function attSize(list){
+  const on = (list || []).filter(f => f.on), known = on.filter(f => Number(f.size) > 0);
+  return {n: on.length, mb: Math.round(known.reduce((a, f) => a + Number(f.size), 0) / 104857.6) / 10, unknown: on.length - known.length};
+}
+export const attSizeHTML = list => { const s = attSize(list); if (!s.n) return '';
+  return `<span class="${s.mb > ATT_WARN_MB ? 'draft-note' : 'muted'}">${s.n} cochée${s.n > 1 ? 's' : ''} · ${s.mb.toLocaleString('fr-FR')} Mo${s.unknown ? ` (+ ${s.unknown} de taille inconnue)` : ''}${s.mb > ATT_WARN_MB ? ' : lourd pour un mail' : ''}</span>`; };
+/** Avant l'envoi : pièces jointes au-delà de ATT_WARN_MB → question ; true = on continue */
+export async function attOk(list){
+  const s = attSize(list); if (s.mb <= ATT_WARN_MB) return true;
+  return confirmAsk('Pièces jointes lourdes', `Les pièces jointes cochées pèsent ${s.mb.toLocaleString('fr-FR')} Mo. Au-delà de ${ATT_WARN_MB} Mo, le mail a plus de risques d’arriver en spam ou d’être refusé ; un lien de partage est souvent préférable.`, 'Continuer quand même');
+}
+/** Zones « [… à compléter] » restées dans un mail (balises vides des modèles, surlignées en jaune) */
+export const todoLeft = m => /\[[^\]\n]{1,40} à compléter\]/.test(`${m.html || ''} ${m.subject || ''}`);
+export const todoOk = async m => !todoLeft(m) || confirmAsk('Zones à compléter', 'Il reste des zones à compléter (en jaune) dans le mail. Elles partiront telles quelles.', 'Continuer quand même');
+
+/** Appel d'un script Google par le relais serveur « script-google » (lot Sécurité v1.47) : le code secret des scripts reste sur le
+ *  serveur, jamais dans le navigateur. target : 'main' (production@) ou 'prospect' (script de prospection). Erreur → message français. */
+export async function callGoogle(target, action, payload = {}){
+  const {data, error} = await sb.functions.invoke('script-google', {body: {target, action, payload}});
+  if (data) return data;
+  const out = await error?.context?.json?.().catch(() => null);   // réponse d'erreur de la fonction : son message français
+  return out?.error ? out : {ok: false, error: 'Script Google injoignable pour le moment : réessaie dans un instant.'};
+}
+
 /** Appel du script Apps Script (compte production@) */
 export async function callScript(action, payload){
-  const url = scriptUrl();
-  if (!url) throw new Error('Le script Google (Apps Script) n’est pas encore installé.');
-  const res = await fetch(url, {method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'},
-    body: JSON.stringify({secret: setting('drive_webhook_secret'), action, ...payload})});
-  const out = await res.json().catch(() => ({ok:false, error:'Réponse illisible du script'}));
+  if (!scriptUrl()) throw new Error('Le script Google (Apps Script) n’est pas encore installé.');
+  const out = await callGoogle('main', action, payload);
   // script pas encore mis à jour sur production@ : on dit quoi faire
   if (!out.ok && /Action inconnue/i.test(out.error || '')) throw new Error('Le script Google de production@ n’est pas à jour. Réglages › Google : « Copier le code à jour », colle-le dans Code.gs puis redéploie (nouvelle version).');
   if (!out.ok) throw new Error(out.error || 'Erreur du script');
@@ -100,21 +126,29 @@ export async function prepareMail(showId, kind){
   const tpls = templatesFor(s, kind);
   if (!tpls.length) return toast(`Aucun modèle « ${MAIL_KINDS[kind]} » pour cet artiste. Ajoute-le dans Réglages › Modèles de mail.`, true);
   const contacts = linksOfStructure(s.structure_id);
-  let contactId = s.conf_contact_id && contacts.some(c=>c.id===s.conf_contact_id) ? s.conf_contact_id : (contacts.find(c=>contactMails(c))?.id || '');
+  // destinataire (v1.55, décision d'Anthony) : en confirmation, jamais « le premier contact de la structure » — le contact déjà choisi
+  // pour la date, sinon celui du suivi de la date s'il est lié à la structure ; sinon on demande de choisir. Autres mails : inchangé.
+  const linked = id => id && contacts.some(c => c.id === id) ? id : '';
+  const suiviContact = linked(byId('prospects', s.prospect_id)?.contact_id);
+  let contactId = linked(s.conf_contact_id) || (kind === 'confirmation' ? suiviContact : (contacts.find(c=>contactMails(c))?.id || ''));
+  const mustPick = kind === 'confirmation' && !contactId;
   let vars = await mailVars(showId, contactId);
   const log = s.mail_log?.[kind];
   const booking = isBookingOnly(s);
   const checks = kind === 'confirmation' ? confChecks(s, booking) : '';
   const sig = prodSignature();
   const extra = `<div class="mail-wrap">
-    ${log ? `<p class="mode-note">${log.sent ? 'Envoyé' : 'Déjà préparé'} le ${fmtDate(log.at.slice(0,10))}${log.to?` à ${esc(log.to)}`:''}${log.draft?' (brouillon Gmail)':''}.</p>` : ''}
+    ${log ? `<p class="mode-note">${log.sent ? 'Envoyé' : 'Déjà préparé'} le ${fmtDate(log.at)}${log.to?` à ${esc(log.to)}`:''}${log.draft?' (brouillon Gmail)':''}.</p>` : ''}
     ${checks}
+    ${vatConflict(s) ? '<p class="mode-note">Structure administrative de l’artiste non soumise à la TVA, mais la TVA de la date n’est pas à 0 % : le TTC affiché dans ce mail est à vérifier (TTC = HT attendu).</p>' : ''}
     <div class="mail-grid">
       <label for="ml-tpl">Modèle</label><select id="ml-tpl">${tpls.map(t=>`<option value="${t.id}">${esc(t.name||MAIL_KINDS[t.kind])}${tplProjects(t).length?'':' · générique'}</option>`).join('')}</select>
       <label>Envoyé par</label><span class="ml-from">${esc(PROD_MAIL)}${sig ? ' <span class="muted">· avec la signature production@</span>' : ' <span class="muted">· pas de signature (Réglages › Prospection, signature de Chloé)</span>'}</span>
-      <label for="ml-contact">Destinataire</label><span class="mail-to"><select id="ml-contact"><option value="">— autre adresse —</option>${contacts.map(c=>`<option value="${c.id}" ${c.id===contactId?'selected':''}>${esc(c.display_name)}${contactMails(c)?` · ${esc(contactMails(c))}`:' (pas de mail)'}</option>`).join('')}</select>
-        <input id="ml-to" type="text" inputmode="email" placeholder="adresse@exemple.fr (plusieurs : séparées par des virgules)" value="${esc(vars.contact_email||'')}"></span>
-      <label for="ml-cc">Copie</label><input id="ml-cc" type="text" placeholder="Nom <adresse@…>, …">
+      <label for="ml-contact" class="rcpt-who">Interlocuteur</label><span class="mail-to rcpt-who"><select id="ml-contact"><option value="">— autre adresse —</option>${contacts.map(c=>`<option value="${c.id}" ${c.id===contactId?'selected':''}>${esc(c.display_name)}${contactMails(c)?` · ${esc(contactMails(c))}`:' (pas de mail)'}</option>`).join('')}</select>
+        <small class="muted">personne à qui l’on s’adresse (prénom et balises du mail) ; la choisir remplace le destinataire</small><span class="rcpt-propose"></span></span>
+      ${mustPick ? `<p class="mode-note rcpt-note">${contacts.filter(c => contactMails(c)).length ? 'Plusieurs contacts possibles et aucun n’est lié à cette date ou à son suivi' : 'Aucun contact identifié pour cette date'} : choisis l’interlocuteur ci-dessus ou une adresse dans le champ Destinataire.</p>` : ''}
+      <label for="ml-to-q">Destinataire</label>${recipientsField('ml-to', s.structure_id, {value: vars.contact_email || '', label: 'Destinataires', interlocutor: 'ml-contact'})}
+      <label for="ml-cc-q">Copie</label>${recipientsField('ml-cc', s.structure_id, {label: 'Copies'})}
       <label for="ml-subj">Objet</label><input id="ml-subj">
     </div>
     ${rtToolbar('ml-body')}<div class="mail-preview" id="ml-body" contenteditable="true" style="${rtStyle()}" aria-label="Texte du mail (modifiable)"></div>
@@ -131,8 +165,9 @@ export async function prepareMail(showId, kind){
       if (!scriptUrl()){ toast('Le script Google (Apps Script) n’est pas encore installé (Réglages).', true); return false; }
       const m = current();
       if (!m.to) { toast('Indique le destinataire', true); return false; }
-      if (/\[\w+ à compléter\]/.test(m.html + m.subject) && !confirm('Il reste des zones à compléter (en jaune). Continuer quand même ?')) return false;
-      if (send && !confirm(`Envoyer le mail à ${m.to} maintenant ?`)) return false;
+      if (!(await todoOk(m))) return false;
+      if (!(await attOk(files))) return false;   // délivrabilité (v1.52) : pièces jointes lourdes
+      if (send && !(await confirmAsk('Envoyer le mail ?', `Le mail part maintenant à ${m.to}${m.cc ? ` (copie : ${m.cc})` : ''}, depuis production@.`, 'Envoyer le mail'))) return false;
       try {
         const out = await callScript('draft', {to: m.to, cc: m.cc, subject: m.subject, html: m.html, send,
           attachments: files.filter(f => f.on).map(f => f.path ? {path: f.path, name: f.name} : {id: f.id})});
@@ -148,7 +183,7 @@ export async function prepareMail(showId, kind){
   const current = () => ({to: $('#ml-to').value.trim(), cc: $('#ml-cc').value.trim(), subject: $('#ml-subj').value.trim(), html: wrapMail($('#ml-body').innerHTML)});
   // Pièces jointes : celles du modèle (cochées) + celles ajoutées pour ce mail (bouton ou glisser-déposer)
   let files = [];
-  const drawFiles = () => { $('#ml-files').innerHTML = files.map((f, i) => `<label class="att-chip"><input type="checkbox" data-att="${i}" ${f.on ? 'checked' : ''}> ${f.path ? '📎' : '🔗'} ${esc(f.name || 'Fichier Drive')}</label>`).join('') || '<span class="muted">aucune</span>'; };
+  const drawFiles = () => { $('#ml-files').innerHTML = files.length ? attSizeHTML(files) + ' ' + files.map((f, i) => `<label class="att-chip"><input type="checkbox" data-att="${i}" ${f.on ? 'checked' : ''}> ${f.path ? '📎' : '🔗'} ${esc(f.name || 'Fichier Drive')}</label>`).join('') : '<span class="muted">aucune</span>'; };
   const draw = () => {
     const t = byId('mail_templates', $('#ml-tpl').value);
     files = [...(t.attachments || []).map(a => ({...a, on: true})), ...files.filter(f => f.mine)]; drawFiles();
@@ -156,23 +191,48 @@ export async function prepareMail(showId, kind){
     $('#ml-subj').value = fill(t.subject, vars, false);
     // date en booking uniquement : pas de fiche de renseignements (les parties s'arrangent entre elles après le mail)
     $('#ml-body').innerHTML = fill(expandAcomptes(booking ? withoutFiche(t.html) : t.html, s), vars, true) + sig;
+    filled = texts();
+    syncChips(document.querySelector('#modal'));
   };
+  let filled = null;
+  const texts = () => [$('#ml-subj').value, $('#ml-body').innerHTML, $('#ml-cc').value].join('\u0000');
+  const edited = () => filled !== null && texts() !== filled;
   draw();
-  $('#ml-tpl').onchange = draw;
+  // texte retouché (objet, texte, copie : à la main, par une pastille ou par un brouillon restauré) : jamais remplacé sans le
+  // demander (v1.56) — comparé à ce que le modèle a rempli la dernière fois
+  const replaceOk = async () => !edited() || await confirmAsk('Remplacer le texte retouché ?', 'L’objet, le texte ou la copie que tu as retouchés seront remplacés par le modèle.', 'Remplacer le texte', {danger: true});
+  $('#ml-tpl').dataset.prev = $('#ml-tpl').value;
+  $('#ml-tpl').onchange = async e => {
+    if (!e.isTrusted){ $('#ml-tpl').dataset.prev = $('#ml-tpl').value; return draw(); }   // brouillon restauré : ses textes reviennent ensuite
+    const next = $('#ml-tpl').value; $('#ml-tpl').value = $('#ml-tpl').dataset.prev;   // en attendant la réponse, le modèle d'avant reste affiché
+    if (!(await replaceOk())) return;
+    $('#ml-tpl').value = $('#ml-tpl').dataset.prev = next; draw();
+  };
   $('#ml-contact').onchange = async e => {
     contactId = e.target.value; vars = await mailVars(showId, contactId);
     // brouillon en cours de restauration (événement non déclenché par un clic) : on garde l'adresse, l'objet et le texte restaurés
     if (!e.isTrusted) return;
-    $('#ml-to').value = vars.contact_email || ''; draw();
+    $('#ml-to').value = vars.contact_email || ''; document.querySelector('#modal .rcpt-note')?.remove();
+    // l'adresse suit toujours le contact ; le texte (salutation…) n'est réécrit que s'il n'a pas été retouché, ou avec accord
+    if (await replaceOk()) draw(); else syncChips(document.querySelector('#modal'));
     if (contactId && contactId !== s.conf_contact_id) save('shows', s.id, {conf_contact_id: contactId}, {rerender:false});
   };
-  $('#ml-files').addEventListener('change', e => { const i = e.target.dataset.att; if (i != null) files[i].on = e.target.checked; });
+  // interlocuteur proposé depuis une adresse choisie (v1.60.3, décision d'Anthony du 07/11) : sur clic seulement ; destinataires et
+  // copies gardés tels quels ; le texte n'est réécrit que s'il n'a pas été retouché, ou avec accord
+  $('#ml-contact').addEventListener('interlocutor', async () => {
+    contactId = $('#ml-contact').value; vars = await mailVars(showId, contactId); document.querySelector('#modal .rcpt-note')?.remove();
+    const cc = $('#ml-cc').value;
+    if (await replaceOk()){ draw(); $('#ml-cc').value = cc; }
+    syncChips(document.querySelector('#modal'));
+    if (contactId && contactId !== s.conf_contact_id) save('shows', s.id, {conf_contact_id: contactId}, {rerender:false});
+  });
+  $('#ml-files').addEventListener('change', e => { const i = e.target.dataset.att; if (i != null){ files[i].on = e.target.checked; drawFiles(); } });
   $('#ml-up').addEventListener('change', async e => {
     for (const f of e.target.files){
       const path = `mails/${s.id}/${Date.now()}_${f.name.replace(/[^\w.\-]+/g, '_')}`;
-      const {error} = await sb.storage.from('suivi').upload(path, f, {contentType: f.type || 'application/octet-stream'});
+      const {error} = await sb.storage.from('suivi').upload(path, typedFile(f), {contentType: contentTypeOf(f)});
       if (error){ toast('Envoi impossible : ' + error.message, true); continue; }
-      files.push({path, name: f.name, on: true, mine: true});
+      files.push({path, name: f.name, size: f.size, on: true, mine: true});
     }
     e.target.value = ''; drawFiles();
   });
@@ -203,11 +263,11 @@ export const isBookingOnly = s => (s?.prod_mode || byId('projects', s?.project_i
  * avec son % et son échéance (« à la signature du contrat » pour le 1er, « le 15 janvier 2027 »… pour les suivants).
  */
 export function expandAcomptes(html, s){
-  const acs = S.db.show_payments.filter(p => p.show_id === s.id && p.kind === 'acompte').sort((a, b) => (a.sort || 0) - (b.sort || 0));
+  const acs = paymentsOf(s.id).filter(p => p.kind === 'acompte');   // lignes hors calcul exclues (v1.44)
   const TAG = '{{acompte_pct}}', FIRST = 'à la signature du contrat';
   if (!acs.length || !String(html || '').includes(TAG)) return html;
   if (acs.length === 1 && (!acs[0].due_label || acs[0].due_label === FIRST)) return html;   // cas simple : le modèle tel quel
-  const pctTxt = p => { const v = billPct(p); return v == null ? '' : String(Math.round(v * 100) / 100).replace('.', ',') + '%'; };
+  const pctTxt = p => { const v = billPct(p); return v == null ? '' : pct(v); };   // « 50 % » (§2.4), comme {{acompte_pct}} côté serveur
   const div = document.createElement('div'); div.innerHTML = String(html);
   const blocks = [...div.querySelectorAll('div,p,li')].filter(b => b.innerHTML.includes(TAG));
   const block = blocks.find(b => !blocks.some(o => o !== b && b.contains(o)));
@@ -235,17 +295,17 @@ export function withoutFiche(html){
 }
 
 function confChecks(s, booking=false){
-  const pays = S.db.show_payments.filter(p => p.show_id === s.id && ['acompte','solde'].includes(p.kind)).sort((a,b)=>(a.sort||0)-(b.sort||0));
+  const pays = paymentsOf(s.id).filter(p => ['acompte','solde'].includes(p.kind));   // lignes hors calcul exclues (v1.44)
   const miss = [];
   if (s.fee_ht == null) miss.push('le cachet HT');
   if (!s.contract_type || s.contract_type === 'N.C') miss.push('le type de contrat');
   if (!s.structure_id) miss.push('la structure');
-  if (!booking && !pays.length) miss.push('les acomptes');
-  const vat = s.vat_rate ?? 5.5, pc = p => { const v = billPct(p); return v == null ? '' : (Math.round(v * 100) / 100).toLocaleString('fr-FR') + ' %'; };
+  if (!booking && !pays.length && !isCoproduction(s)) miss.push('les acomptes');   // coproduction : aucun acompte attendu (27/10/2026)
+  const vat = s.vat_rate ?? 5.5, pc = p => { const v = billPct(p); return v == null ? '' : pct(v); };
   return `<div class="conf-check ${miss.length?'warn':''}">
-    <b>${s.terms_validated_at ? `Conditions validées le ${fmtDate(s.terms_validated_at.slice(0,10))}` : 'Conditions reprises dans le mail'}</b>
-    <div>${esc(s.contract_type||'Contrat ?')} · ${s.fee_ht!=null?`${Number(s.fee_ht).toLocaleString('fr-FR')} € HT · TVA ${String(vat).replace('.',',')} %`:'cachet ?'}
-      ${booking ? '' : '· ' + (pays.map(p=>`${esc(p.label||p.kind)} ${pc(p)}`).join(' · ') || 'aucun acompte')}</div>
+    <b>${s.terms_validated_at ? `Conditions validées le ${fmtDate(s.terms_validated_at)}` : 'Conditions reprises dans le mail'}</b>
+    <div>${esc(s.contract_type||'Contrat ?')} · ${s.fee_ht!=null?`${eur2(s.fee_ht)} HT · TVA ${pct(vat)}`:'cachet ?'}
+      ${booking ? '' : '· ' + (pays.map(p=>`${esc(p.label||p.kind)} ${pc(p)}`).join(' · ') || (isCoproduction(s) ? 'coproduction : ni acompte ni solde' : 'aucun acompte'))}</div>
     ${miss.length ? `<div class="err">Manque : ${miss.join(', ')}. Ferme ce mail et valide les conditions de la date (le mail reprend ces infos).</div>` : ''}
     <div class="muted">${booking ? 'Booking uniquement : le lien de la fiche de renseignements est retiré du mail, l’organisateur et l’artiste s’arrangent entre eux pour le contrat.' : 'La fiche de renseignements affiche toujours les conditions à jour : tu peux encore les corriger après l’envoi, tant que le contrat n’est pas parti.'}</div>
   </div>`;
@@ -309,7 +369,7 @@ export async function editTemplate(id, defaults={}){
       {k:'applies_to', label:'Proposé en premier pour', type:'select', blank:false, options:Object.entries(APPLIES), full:true,
         help:'Au moment de préparer le mail, ce modèle est choisi automatiquement pour ces dates. Les autres modèles restent disponibles dans la liste.'},
       {k:'subject', label:'Objet', full:true},
-      {k:'cc', label:'En copie', full:true, placeholder:'Nom <adresse@…>, …'},
+      {k:'cc', label:'En copie', full:true, mails:true, placeholder:'Nom <adresse@…>, …'},
     ], extra,
     onSave: async v => {
       const ids = v.project_ids || [];
@@ -318,6 +378,8 @@ export async function editTemplate(id, defaults={}){
       if (id) return !!(await save('mail_templates', id, row));
       return !!(await insert('mail_templates', row));
     },
+    deleteAsk: () => ({title: 'Supprimer le modèle ?', text: `Supprimer le modèle de mail « ${byId('mail_templates', id)?.name || ''} » ? Les mails déjà envoyés ne changent pas.`,
+      actions: [{value: 'del', label: 'Supprimer le modèle', danger: true}]}),
     onDelete: id ? () => remove('mail_templates', id) : null});
   const body = document.querySelector('#tpl-body');
   document.querySelector('#modal [name=variant]')?.setAttribute('list', 'tpl-variants');
@@ -328,7 +390,7 @@ export async function editTemplate(id, defaults={}){
   document.querySelector('#tpl-up').addEventListener('change', async e => {
     for (const f of e.target.files){
       const path = `modeles/${id || 'nouveau'}/${Date.now()}_${f.name.replace(/[^\w.\-]+/g, '_')}`;
-      const {error} = await sb.storage.from('suivi').upload(path, f, {contentType: f.type || 'application/octet-stream'});
+      const {error} = await sb.storage.from('suivi').upload(path, typedFile(f), {contentType: contentTypeOf(f)});
       if (error){ toast('Envoi impossible : ' + error.message, true); continue; }
       files.push({path, name: f.name, size: f.size});
     }

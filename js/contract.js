@@ -7,31 +7,27 @@
  * 3. generateContract() : le script Google copie le modèle (Réglages › Contrats) dans le dossier
  *    de la date, remplit les balises <<…>> et les montants, puis exportContractPdf() en fait un PDF.
  */
+import { confirmAsk } from './ui/dialog.js';
 import { paymentsOf, planAmount, showVat } from './calc.js';
 import { save } from './data.js';
-import { FICHE_SECTIONS, ficheDefaults, ficheKind, fieldOn } from './fiche-fields.js';
+import { FICHE_SECTIONS, deptOf, ficheDefaults, ficheKind, fieldOn, venueSource } from './fiche-fields.js';
 import { callScript } from './mail.js';
 import { byId, eventsOfStructure, setting } from './selectors.js';
 import { openModal } from './ui/modal.js';
-import { esc, fmtDate, toast, today } from './utils.js';
+import { addDays, esc, fmtDate, toast, today } from './utils.js';
 
-/** Département pour les noms de fichiers : 79200 → 79, Corse 2A / 2B, outre-mer 971… ; sinon le département de la date (CH, BE… à l'étranger) */
-export function deptOf(postal, fallback){
-  const cp = String(postal || '').replace(/\s/g, '');
-  if (/^\d{5}$/.test(cp)) return /^9[78]/.test(cp) ? cp.slice(0, 3) : /^20/.test(cp) ? (Number(cp) < 20200 ? '2A' : '2B') : cp.slice(0, 2);
-  const d = String(fallback || '').trim();
-  return /^\d$/.test(d) ? '0' + d : d.toUpperCase();
-}
+/** Département (règle {{cp}}) : défini dans fiche-fields.js (aussi chargé par la page publique), réexporté ici */
+export { deptOf };
+
 const stripCode = name => String(name || '').replace(/\s*•.*$/, '').trim();
 const venueName = v => String(v || '').replace(/\*\*/g, '').replace(/\s*•\s*[A-Z/]{1,5}(\s*\([^)]*\))?\s*$/, '').trim();
 const num = n => n == null || n === '' ? '' : Number(n).toLocaleString('fr-FR', {minimumFractionDigits: Number(n) % 1 ? 2 : 0, maximumFractionDigits: 2}).replace(/ /g, ' ');
 const longDate = d => d ? new Date(d + 'T12:00:00').toLocaleDateString('fr-FR', {weekday:'long', day:'numeric', month:'long', year:'numeric'}).replace(/^(\D+ )1 /, '$11er ') : '';
-const addDays = (d, n) => { const x = new Date(d + 'T12:00:00'); x.setDate(x.getDate() + n); return x.toISOString().slice(0, 10); };
 
 /** Ce que l'app sait déjà de la date (proposé quand l'organisateur n'a rien répondu) */
 function knownValues(s){
   const st = byId('structures', s.structure_id);
-  const defs = ficheDefaults({structure: st, venue: venueName(s.venue), city: s.city, cp: st?.postal_code || s.department, capacity: s.capacity ?? eventsOfStructure(st?.id).find(e => e.capacity)?.capacity ?? (st?.capacity_1 || null), ticketing_type: s.ticketing_type, cr_break: s.cr_break});
+  const defs = ficheDefaults({structure: st, venue: venueName(s.venue), city: s.city, address: s.address, postal_code: s.postal_code, department: s.department, venue_is_structure: s.venue_is_structure, capacity: s.capacity ?? eventsOfStructure(st?.id).find(e => e.capacity)?.capacity ?? (st?.capacity_1 || null), ticketing_type: s.ticketing_type, cr_break: s.cr_break});
   return {...defs, ...(st?.admin || {}), ...(s.show_time ? {show_time: s.show_time} : {}), ...(s.set_length ? {set_length: s.set_length} : {})};
 }
 
@@ -59,7 +55,7 @@ export function validateFiche(showId){
     }).join('');
   }).join('');
   const extra = `<div class="mail-wrap">
-    <p class="help mt0">${s.fiche_submitted_at ? `Fiche envoyée par l’organisateur le ${fmtDate(s.fiche_submitted_at.slice(0,10))}.` : 'L’organisateur n’a pas encore rempli la fiche : tu peux tout de même compléter les infos ici.'}
+    <p class="help mt0">${s.fiche_submitted_at ? `Fiche envoyée par l’organisateur le ${fmtDate(s.fiche_submitted_at)}.` : 'L’organisateur n’a pas encore rempli la fiche : tu peux tout de même compléter les infos ici.'}
       Corrige la colonne « Valeur retenue » si besoin : c’est elle qui part dans le contrat. En orange : l’organisateur a donné une autre valeur que celle de la fiche structure.</p>
     <div class="tbl-wrap"><table class="vf-table"><thead><tr><th>Champ</th><th>Réponse de l’organisateur</th><th>Valeur retenue</th></tr></thead><tbody>${rows}</tbody></table></div>
     <label class="check-line"><input type="checkbox" id="vf-struct" checked> Mettre à jour les coordonnées de la structure${st ? ` « ${esc(st.name)} »` : ''} avec ces valeurs</label>
@@ -125,8 +121,9 @@ export function contractVars(s){
   if (pr.setup_hours) seq.push({find: 'au moins XX heures', values: [`au moins ${num(pr.setup_hours)} heure${pr.setup_hours > 1 ? 's' : ''}`]});
   const st = byId('structures', s.structure_id);
   // Le département est celui du LIEU de la date (pas l'adresse du siège de la structure, souvent ailleurs)
-  const sameCity = st?.city && s.city && st.city.trim().toLowerCase() === s.city.trim().toLowerCase();
-  const dp = deptOf(d.venue_postal_code, s.department) || deptOf(sameCity ? st.postal_code : '', '');
+  // décision d'Anthony du 07/11/2026 : même source de lieu que l'adresse — département de la date, sinon tiré du code postal du lieu
+  // (fiche validée, puis source du lieu : la structure seulement si elle est confirmée comme lieu) ; jamais celui d'un organisateur non confirmé
+  const dp = deptOf('', s.department) || deptOf(d.venue_postal_code, '') || venueSource(s, st).department || '';
   const name = [tags["Nom de L'Artiste"], s.date, `${s.city || d.venue_city || ''}${dp ? ` (${dp})` : ''}`, venueName(s.venue), kind.toUpperCase()].filter(Boolean).join(' • ');
   return {kind, tags, seq, name, missing: Object.entries(tags).filter(([k, v]) => v === '' && !(kind === 'cc' && /Minimum|Break|% du/.test(k)) && !(kind === 'cr' && /Prix de Cession|Billetterie/.test(k)) && k !== 'N° Licence Entrepreneur du Spectacle').map(([k]) => k)};
 }
@@ -143,9 +140,9 @@ export async function generateContract(showId){
   const v = contractVars(s);
   if (!templateId(v.kind, s)) return toast(`Ajoute le modèle de contrat ${v.kind === 'cr' ? 'de co-réalisation' : 'de cession'} dans Réglages › Contrats`, true);
   if (!s.drive_folder_id) return toast('Crée ou lie d’abord le dossier Drive de la date', true);
-  if (!s.fiche_validated_at && !confirm('La fiche de renseignements n’est pas validée. Générer quand même le contrat ?')) return;
-  if (v.missing.length && !confirm(`Infos manquantes (laissées visibles dans le contrat) :\n• ${v.missing.join('\n• ')}\n\nGénérer quand même ?`)) return;
-  if (s.contract_doc_id && !confirm('Un contrat existe déjà pour cette date. En générer un nouveau ? (l’ancien reste dans le Drive)')) return;
+  if (!s.fiche_validated_at && !(await confirmAsk('Fiche pas validée', 'La fiche de renseignements de cette date n’est pas validée.', 'Générer quand même le contrat'))) return;
+  if (v.missing.length && !(await confirmAsk('Infos manquantes', `Infos manquantes (laissées visibles dans le contrat) :\n${v.missing.map(x => '• ' + x).join('\n')}`, 'Générer quand même le contrat'))) return;
+  if (s.contract_doc_id && !(await confirmAsk('Générer un nouveau contrat ?', 'Un contrat existe déjà pour cette date. L’ancien reste dans le Drive, rien n’est supprimé.', 'Générer un nouveau contrat'))) return;
   toast('Préparation du contrat…');
   try {
     const out = await callScript('contract', {template_id: templateId(v.kind, s), folder_id: s.drive_folder_id, name: v.name, tags: v.tags, seq: v.seq});

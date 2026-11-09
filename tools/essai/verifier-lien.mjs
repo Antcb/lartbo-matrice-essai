@@ -1,5 +1,5 @@
 // ESSAI (branche essai/c1-interface, jamais fusionnée) : vérifie depuis Internet le lien d'essai servi par githack pour ce commit.
-// Attendu : version 1.41.4, projet de TEST uniquement, aucune requête vers la production, écran de connexion affiché.
+// Attendu : version 1.61.0 (calendriers), projet de TEST uniquement, aucune requête vers la production, écran de connexion affiché.
 import { chromium } from 'playwright';
 const base = process.env.BASE || 'https://antcb.github.io/lartbo-matrice-essai/';
 const PROD = 'ypvvjoqhzddzbmerypdc', TEST = 'dthfocplfzzmkgaxhmwk';
@@ -13,7 +13,7 @@ for (const chemin of ['index.html', 'index.html?prod', 'index.html?test', 'fiche
   await p.waitForTimeout(4000);
   const info = await p.evaluate(async () => { const c = await import('./js/config.js'); return { v: c.APP_VERSION, env: c.ENV, url: c.CFG.SUPABASE_URL, login: !!document.querySelector('#login-pw'), bandeau: (document.querySelector('.test-banner, .test-note')?.textContent || '').slice(0, 140), liensProd: [...document.querySelectorAll('a[href*="prod"]')].length, titre: document.title, corps: document.body?.innerText.slice(0, 160).replace(/\s+/g, ' '), modules: [...document.scripts].map(x => x.src || x.type).join(' ') }; }).catch(e => ({ erreur: String(e) }));
   const page = chemin.startsWith('fiche') ? /fiche|Fiche/.test(info.titre || '') || true : info.login;
-  const ok = res?.ok() && page && !/rawgit|githack|Notice/i.test(info.titre || '') && info.v === '1.41.4' && info.env === 'test' && String(info.url).includes(TEST) && prod === 0 && /SITE D’ESSAI C1 · version 1\.41\.4/.test(info.bandeau || '') && info.liensProd === 0;
+  const ok = res?.ok() && page && !/rawgit|githack|Notice/i.test(info.titre || '') && info.v === '1.61.0' && info.env === 'test' && String(info.url).includes(TEST) && prod === 0 && /SITE D’ESSAI CALENDRIERS · version 1\.61\.0/.test(info.bandeau || '') && info.liensProd === 0;
   if (!ok) ko++;
   log(`${ok ? '[OK]' : '[ÉCHEC]'} ${chemin} → HTTP ${res?.status()} · version ${info.v} · env ${info.env} · base ${info.url} · écran de connexion ${info.login} · requêtes production ${prod} · bandeau « ${info.bandeau} » · liens ?prod ${info.liensProd} · titre « ${info.titre} » · début « ${info.corps} » · scripts ${info.modules}`);
   log(`      hôtes contactés : ${[...hotes].sort().join(', ')}`);

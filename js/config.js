@@ -1,7 +1,7 @@
 /**
  * Réglages : adresse et clé publique Supabase, équipe autorisée, numéro de version.
  */
-export const APP_VERSION = '1.41.4';   // ← incrémenté par tools/bump_version.py (voir CHANGELOG.md)
+export const APP_VERSION = '1.61.0';   // ← incrémenté par tools/bump_version.py (voir CHANGELOG.md)
 
 /**
  * Espace de test : …/lartbo-matrice/?test bascule l'application de ce navigateur sur le projet Supabase « Lartbo-matrice-test »
@@ -17,7 +17,7 @@ export const PUBLIC_PAGE = (() => {
   let p = location.pathname; try { p = decodeURIComponent(p); } catch { /* adresse mal encodée : prise telle quelle */ }
   return /(^|\/)(fiche|artiste|rh)(\.html?)?\/?$/i.test(p);
 })();
-// ⚠ SITE D'ESSAI lartbo-matrice-essai (branche essai/c1-interface, JAMAIS FUSIONNÉE) : copie du lot C1 (commit 3fe2238)
+// ⚠ SITE D'ESSAI lartbo-matrice-essai (copie de la branche dev/v1.62-calendriers, commit 0c809b0, JAMAIS FUSIONNÉE ici) :
 // FORCÉE sur le projet de test Lartbo-matrice-test, quels que soient l'adresse et le lien (?prod sans effet). Le choix
 // d'environnement gardé par le navigateur n'est ni lu ni modifié (même adresse antcb.github.io que la vraie Matrice).
 export const ENV = 'test';

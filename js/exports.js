@@ -7,7 +7,7 @@ import { STATUSES, isOff } from './constants.js';
 import { projName, structName } from './selectors.js';
 import { S } from './state.js';
 import { openModal } from './ui/modal.js';
-import { downloadCSV, toast, today } from './utils.js';
+import { downloadCSV, fmtDate, toast, today } from './utils.js';
 
 const BRAND = 'FF283C63', TINT = 'FFE8ECF3';
 let EXCEL = null;
@@ -52,7 +52,7 @@ export async function exportTable({name, title, subtitle = '', columns, rows, fo
   const tc = String.fromCharCode(65 + Math.max(ci, 1));
   ws.getCell(tc + '1').value = title; ws.getCell(tc + '1').font = {name: 'Geist', size: 16, bold: true, color: {argb: BRAND}};
   ws.getCell(tc + '2').value = subtitle; ws.getCell(tc + '2').font = {name: 'Geist', size: 11, color: {argb: 'FF5B677D'}};
-  ws.getCell(tc + '3').value = `Export du ${new Date().toLocaleDateString('fr-FR')} · L'ArtBoristerie Productions · production@lartboristerie.com`;
+  ws.getCell(tc + '3').value = `Export du ${fmtDate(today())} · L'ArtBoristerie Productions · production@lartboristerie.com`;
   ws.getCell(tc + '3').font = {name: 'Geist', size: 9, color: {argb: 'FF8A94A6'}};
   // Ligne d'en-têtes
   const head = ws.getRow(6);
@@ -107,7 +107,8 @@ export function exportShows(){
       if (!v.statuses.length){ toast('Coche au moins un statut', true); return false; }
       const from = v.mode === 'year' ? `${v.year}-01-01` : v.from, to = v.mode === 'year' ? `${v.year}-12-31` : v.to;
       if (v.mode === 'range' && (!from || !to)){ toast('Indique le début et la fin de la période', true); return false; }
-      const list = S.db.shows.filter(s => s.project_id === v.project && v.statuses.includes(s.status) && s.date && s.date >= from && s.date <= to)
+      const list = S.db.shows.filter(s => !s.archived_at && s.project_id === v.project &&   // export des dates (liste de travail) : sans les archivées (v1.60.3)
+         v.statuses.includes(s.status) && s.date && s.date >= from && s.date <= to)
         .sort((a, b) => a.date.localeCompare(b.date));
       const artist = projName(v.project).replace(/\s*•.*$/, '');
       // Jour, date, lieu, département / pays, statut ; cachet et structure si cochés

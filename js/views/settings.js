@@ -1,36 +1,37 @@
 /**
  * Réglages : pourcentages par défaut (acompte + solde = 100 %), partenaires, version.
  */
+import { confirmAsk } from '../ui/dialog.js';
 import { APP_VERSION } from '../config.js';
 import { sb } from '../data.js';
-import { departments, setting } from '../selectors.js';
+import { departments, setting, settingAcompte } from '../selectors.js';
 import { fetchAll } from '../data.js';
 import { S, touch } from '../state.js';
-import { isInvoiced } from '../calc.js';
+import { isCoproduction, isInvoiced, paymentsOf } from '../calc.js';
 import { viewHead } from '../ui/bits.js';
 import { cIn } from '../ui/cells.js';
-import { esc, toast } from '../utils.js';
+import { esc, toast, pct, today } from '../utils.js';
 import { render } from '../app.js';
 import { templatesList } from '../mail.js';
 import { templateForm } from '../budget-template.js';
 import { FONTS, SIZES, mailFont, rtStyle, rtToolbar } from '../ui/richtext.js';
 
 export function viewSettings(){
-  const ac = Number(setting('default_acompte_pct') ?? 0);
+  const acRaw = setting('default_acompte_pct'), ac = settingAcompte(), acShown = acRaw == null || String(acRaw).trim() === '' ? '' : ac;   // vide : affiché vide (50 % appliqué), jamais 0 (§6.4)
   return viewHead('Réglages') + `
   <div class="grid-cards" style="grid-template-columns:repeat(auto-fill,minmax(360px,1fr))">
     <div class="panel pad"><h3 class="panel-title">Pourcentages par défaut</h3>
       <p class="help mb">Appliqués aux nouvelles dates confirmées. Chaque date et chaque projet peuvent les remplacer.</p>
       <div class="steps kv-grid">
-        <label for="set-ac">Acompte (% du cachet)</label><input id="set-ac" type="number" step="any" data-act-setting="default_acompte_pct" value="${esc(ac)}">
-        <label>Solde (100 % − acompte)</label><span><b>${esc(100 - ac)} %</b></span>
+        <label for="set-ac">Acompte (% du cachet)</label><input id="set-ac" type="number" step="any" data-act-setting="default_acompte_pct" value="${esc(acShown)}" placeholder="50">
+        <label>Solde (100 % − acompte)</label><span><b>${esc(pct(100 - ac))}</b></span>
         <label for="set-artbo-b">Commission L'ArtBo par défaut — booking (%)</label><input id="set-artbo-b" type="number" step="any" data-act-setting="default_artbo_pct_booking" value="${esc(setting('default_artbo_pct_booking')??15)}">
         <label for="set-artbo-p">Commission L'ArtBo par défaut — production (%)</label><input id="set-artbo-p" type="number" step="any" data-act-setting="default_artbo_pct_production" value="${esc(setting('default_artbo_pct_production')??20)}">
         <label for="set-cnm">Taxe CNM (%)</label><input id="set-cnm" type="number" step="any" data-act-setting="default_cnm_pct" value="${esc(setting('default_cnm_pct')??'')}">
         <label for="set-mvm">Coût Movinmotion par bulletin (€)</label><input id="set-mvm" type="number" step="any" data-act-setting="movinmotion_payslip_cost" value="${esc(setting('movinmotion_payslip_cost')??'')}">
       </div>
       <p class="help mt mb-sm">Les nouvelles dates confirmées prennent ces pourcentages. Les dates déjà confirmées gardent les leurs, sauf si tu les mets à jour :</p>
-      <button class="btn sm" data-act="applyAcompte">Appliquer ${esc(ac)} % / ${esc(100-ac)} % aux acomptes et soldes pas encore envoyés</button></div>
+      ${ac === 0 ? '' : `<button class="btn sm" data-act="applyAcompte">Appliquer ${esc(pct(ac))} / ${esc(pct(100-ac))} aux acomptes et soldes pas encore envoyés</button>`}</div>
     <div class="panel pad"><h3 class="panel-title">Budget type</h3>
       <p class="help mb">Le budget prévisionnel posé sur chaque nouvelle date confirmée en production.</p>
       ${templateForm('settings')}</div>
@@ -62,7 +63,7 @@ export function viewSettings(){
       <p class="help mb">Le script Google installé sur le compte production@ crée les dossiers Drive des dates et les brouillons Gmail.</p>
       <div class="steps">
         <label for="set-gas">Adresse du script (Apps Script)</label><input id="set-gas" data-setting-text="drive_webhook_url" value="${esc(setting('drive_webhook_url')||'')}" placeholder="https://script.google.com/macros/s/…/exec">
-        <label>Code secret à coller dans le script</label><span class="secret-line"><code>${esc(String(setting('drive_webhook_secret')||'').slice(0,8))}…</code> <button class="btn sm ghost" data-act="copySecret">Copier</button></span>
+        <label>Code secret du script</label><span class="help">Gardé sur le serveur, jamais affiché ici (propriété WEBHOOK_SECRET du script ; valeur dans Supabase › table settings › drive_webhook_secret).</span>
         <label for="set-mac">Dossier Google Drive sur le Mac</label><input id="set-mac" data-setting-text="drive_mac_root" value="${esc(setting('drive_mac_root')||'')}" placeholder="/Users/…/Library/CloudStorage/GoogleDrive-…/Mon Drive">
         <label for="set-emp">Dossier Drive des salariés</label><input id="set-emp" data-setting-text="employees_folder_id" value="${esc(setting('employees_folder_id')||'')}" placeholder="ID ou lien du dossier">
         <label for="set-fin">Dossier « 01_Finance » (bulletins de paie, notes de frais)</label><input id="set-fin" data-setting-text="finance_folder_id" value="${esc(setting('finance_folder_id')||'')}" placeholder="Lien du dossier">
@@ -74,10 +75,22 @@ export function viewSettings(){
       <p class="help mt-sm">Mettre à jour le script : sur production@, ouvre script.google.com › le projet du script › fichier Code.gs › sélectionne tout et colle le code copié › Enregistrer › Déployer › Gérer les déploiements › crayon › Version : Nouvelle version › Déployer. L’adresse ne change pas.</p>
       <div class="vh-actions mt"><button class="btn sm" data-act="testScript">Tester le script</button>
         <button class="btn sm" data-act="driveScan">Rattacher les dossiers Drive existants</button></div>
-      <p class="help mt mb-sm">Noms des dossiers de dates (« MM-DD • Ville • Salle (79) ») et des contrats (« Artiste • AAAA-MM-JJ • Ville (79) • Salle • CC/CR ») : la vérification crée un Google Sheet avec les renommages proposés, sans rien toucher. Décoche ce qui ne convient pas, puis applique.</p>
+      <p class="help mt mb-sm">Noms des dossiers de dates (« MM-DD • Ville • Salle (79) ») et des contrats (« Artiste • AAAA-MM-JJ • Ville (79) • Salle • CC/CR ») : la vérification crée un Google Sheet avec les renommages proposés (ancien nom → nouveau nom), sans rien toucher. Tout arrive décoché : coche seulement les dossiers que tu veux renommer, puis applique. Les contrats sont listés pour information et ne sont jamais renommés.</p>
       <div class="vh-actions"><button class="btn sm" data-act="renameAudit">Vérifier les noms</button>
         ${setting('rename_sheet_url') ? `<a class="btn sm" href="${esc(setting('rename_sheet_url'))}" target="_blank" rel="noopener">Ouvrir le dernier tableau</a>` : ''}
         <button class="btn sm" data-act="renameApply">Appliquer les renommages cochés</button></div></div>
+    <div class="panel pad"><h3 class="panel-title">Agendas des artistes (lecture seule)</h3>
+      <p class="help mb">Les artistes partagent leur agenda Google avec <b>production@</b>. Un petit script <b>séparé</b>, installé sur ce compte, les lit sans pouvoir rien y écrire (accès « lecture seule » aux agendas) :</p>
+      <ol class="help steps-list">
+        <li><button class="btn sm" data-act="copyCalendarScript">Copier le code du script</button> et <button class="btn sm" data-act="copyCalendarManifest">Copier le fichier appsscript.json</button></li>
+        <li>Sur <a href="https://script.google.com/home/projects/create" target="_blank" rel="noopener">script.google.com</a> connecté avec production@ : nouveau projet « Matrice Agendas », colle le code dans Code.gs.</li>
+        <li>Paramètres du projet › coche « Afficher le fichier manifeste appsscript.json », puis remplace son contenu par le fichier copié (accès en lecture seule).</li>
+        <li>Paramètres du projet › Propriétés du script › <b>SECRET_AGENDAS</b> : le secret propre à ce script (Supabase › Table Editor › schéma <b>private</b> › table <b>import_secrets</b> › ligne <b>cal_script_secret</b> › colonne <b>value</b>, à copier toi-même, jamais dans une conversation).</li>
+        <li>Déployer › Nouveau déploiement › <b>Application Web</b> · Exécuter en tant que : <b>moi</b> · Accès : <b>Tout le monde</b> › Déployer, autorise l’accès, puis colle l’adresse (…/exec) ici :</li>
+      </ol>
+      <div class="steps"><label for="set-cscript">Adresse du script des agendas</label><input id="set-cscript" data-setting-text="calendar_script_url" value="${esc(setting('calendar_script_url')||'')}" placeholder="https://script.google.com/macros/s/…/exec"></div>
+      <div class="vh-actions mt"><button class="btn sm" data-act="testCalendarScript">Tester</button></div>
+      <p class="help mt">Ensuite, dans la fiche de chaque artiste : « Relier son agenda Google ». Synchronisation toutes les 5 minutes une fois activée, ou « Actualiser ».</p></div>
     <div class="panel pad"><h3 class="panel-title">Prospection</h3>
       <p class="help mb">Les mails de prospection et les relances partent du Gmail de <b>${esc(setting('prospect_from') || 'anthony@lartboristerie.com')}</b> grâce à un petit script installé sur ce compte (une seule fois) :</p>
       <ol class="help" style="margin:0 0 12px;padding-left:18px">
@@ -99,12 +112,12 @@ export function viewSettings(){
       ${rtToolbar('set-sig-prod')}<div class="mail-preview" id="set-sig-prod" contenteditable="true" style="${rtStyle()}">${setting('prospect_signature_production') || ''}</div>
       <div class="vh-actions mt-sm"><button class="btn sm" data-act="saveSignature" data-key="prospect_signature_production" data-el="set-sig-prod">Enregistrer la signature</button></div></div>
     <div class="panel pad"><h3 class="panel-title">Brevo</h3>
-      <p class="help mb">Chaque nouveau contact de la Matrice qui a un mail est ajouté automatiquement dans Brevo (mail, prénom, nom, structure). Un mail déjà présent dans Brevo n’est jamais modifié : ni ses infos, ni ses listes, et un désabonné reste désabonné. Dans Brevo : ton nom en haut à droite › « SMTP et API » › onglet « Clés API » › « Générer une nouvelle clé API », puis colle-la ici. La liste est facultative : son numéro est dans Contacts › Listes (colonne ID).</p>
+      <p class="help mb">Chaque nouveau contact de la Matrice qui a un mail est ajouté automatiquement dans Brevo (mail, prénom, nom, structure). Un mail déjà présent dans Brevo n’est jamais modifié : ni ses infos, ni ses listes, et un désabonné reste désabonné. Un contact lié uniquement à des structures inactives n’est pas ajouté (il l’est si l’une de ses structures est réactivée). Dans Brevo : ton nom en haut à droite › « SMTP et API » › onglet « Clés API » › « Générer une nouvelle clé API », puis colle-la ici. La liste est facultative : son numéro est dans Contacts › Listes (colonne ID).</p>
       <div class="steps">
-        <label for="set-brevo">Clé API Brevo</label><input id="set-brevo" type="password" autocomplete="off" data-1p-ignore data-setting-text="brevo_api_key" value="${esc(setting('brevo_api_key')||'')}" placeholder="xkeysib-…">
+        <label for="set-brevo">Clé API Brevo</label><span class="secret-line"><input id="set-brevo" type="password" autocomplete="off" data-1p-ignore data-brevo-key="1" placeholder="xkeysib-…"> <span class="muted" id="brevo-state">…</span></span>
         <label for="set-brevo-list">Liste Brevo (n°, ou plusieurs séparés par des virgules)</label><input id="set-brevo-list" data-setting-text="brevo_list_id" value="${esc(setting('brevo_list_id')||'')}" placeholder="ex. 3">
       </div>
-      <div class="vh-actions mt"><button class="btn sm" data-act="brevoSyncAll" ${setting('brevo_api_key') ? '' : 'disabled title="Colle d’abord la clé API"'}>Envoyer tous les contacts existants à Brevo</button></div></div>
+      <div class="vh-actions mt"><button class="btn sm" data-act="brevoSyncAll">Envoyer tous les contacts existants à Brevo</button></div></div>
     <div class="panel pad"><h3 class="panel-title">IA (résumés de suivi)</h3>
       <p class="help mb">Le bouton « Mettre à jour avec l’IA » d’un suivi utilise Gemini, l’IA gratuite de Google. Va sur <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a> avec le compte production@, clique sur « Create API key » (« Créer une clé API »), copie la clé (elle commence par « AIza » ou « AQ. ») et colle-la ici. Les demandes partent toujours des serveurs de Paris : Google applique alors ses règles européennes (pas d’entraînement de son IA sur vos données, pas de relecture humaine).</p>
       <div class="steps">
@@ -138,6 +151,9 @@ export async function refreshAiState(){
   const pl = document.getElementById('pl-state'); if (!pl) return;
   const {data: ok} = await sb.rpc('pennylane_status');
   pl.textContent = ok ? '✓ jeton enregistré' : 'pas encore de jeton';
+  const br = document.getElementById('brevo-state'); if (!br) return;
+  const {data: brevo} = await sb.rpc('brevo_key_status');   // la clé Brevo n'est jamais renvoyée au navigateur (v1.47)
+  br.textContent = brevo ? '✓ clé enregistrée' : 'pas encore de clé';
 }
 
 document.addEventListener('change', async e => {
@@ -148,6 +164,13 @@ document.addEventListener('change', async e => {
     const {error} = await sb.rpc('set_ai_key', {k: m ? m[0] : ''});
     if (error) return toast(error.message, true);
     e.target.value = ''; toast(m ? 'Clé IA enregistrée' : 'Clé IA retirée'); refreshAiState(); return;
+  }
+  if (e.target.dataset.brevoKey){
+    const v = e.target.value.trim(), m = v.match(/xkeysib-[\w-]+/);
+    if (v && !m) return toast('Ce n’est pas une clé API Brevo : elle commence par « xkeysib- » (Brevo › SMTP et API › Clés API)', true);
+    const {error} = await sb.rpc('set_brevo_key', {k: m ? m[0] : ''});
+    if (error) return toast(error.message, true);
+    e.target.value = ''; toast(m ? 'Clé Brevo enregistrée' : 'Clé Brevo retirée'); refreshAiState(); return;
   }
   if (e.target.dataset.plKey){
     const v = e.target.value.trim().replace(/^Bearer\s+/i, '');
@@ -160,14 +183,16 @@ document.addEventListener('change', async e => {
     let v = e.target.value.trim();
     if (/_id$/.test(kt) && kt !== 'brevo_list_id') v = (v.match(/[-\w]{25,}/) || [v])[0];   // un lien Drive collé → son identifiant
     if (kt === 'brevo_list_id') v = (v.match(/\d+/g) || []).join(', ');   // « #2 » → 2
-    if (kt === 'brevo_api_key' && v){ const k = v.match(/xkeysib-[\w-]+/); if (!k){ toast('Ce n’est pas une clé API Brevo : elle commence par « xkeysib- » (Brevo › SMTP et API › Clés API)', true); e.target.value = setting('brevo_api_key') || ''; return; } v = k[0]; }
+    // adresses où le serveur envoie le code secret : seulement un script Google publié (même contrôle que la base et script-google, v1.47)
+    if (['drive_webhook_url', 'prospect_script_url', 'calendar_script_url'].includes(kt) && v && !/^https:\/\/script\.google\.com\/(a\/macros\/[\w.-]+|macros)\/s\/[\w-]+\/exec$/.test(v)){
+      toast('Colle l’adresse du déploiement du script Google : elle commence par https://script.google.com/ et finit par /exec', true); e.target.value = setting(kt) || ''; return; }
     if (await setSetting(kt, v)){ e.target.value = v; toast('Réglage enregistré'); if (/^mail_font/.test(kt)) render(); }
     return; }
   const k = e.target.dataset.actSetting; if (!k) return;
   const v = e.target.value===''?null:Number(e.target.value);
   if (k==='default_acompte_pct'){
     if (v==null || v<0 || v>100) return toast("L'acompte doit être entre 0 et 100 %", true);
-    if (await setSetting(k, v) && await setSetting('default_solde_pct', 100 - v)) toast(`Acompte ${v} % · solde ${100 - v} %`);
+    if (await setSetting(k, v) && await setSetting('default_solde_pct', 100 - v)) toast(`Acompte ${pct(v)} · solde ${pct(100 - v)}`);
     render();
     return applyAcompte();   // les dates à venir pas encore facturées suivent (après confirmation)
   }
@@ -192,18 +217,22 @@ document.addEventListener('change', async e => {
 });
 
 export async function applyAcompte(){
-  const ac = Number(setting('default_acompte_pct') ?? 0);
-  if (!confirm(`Mettre ${ac} % d’acompte et ${100-ac} % de solde sur les dates à venir pas encore facturées ?`)) return;
+  const ac = settingAcompte();   // 0 % gardé tel quel ; 50 seulement si le réglage est vide (§6.4)
+  // 0 % = date SANS acompte (§6.4) : jamais d'acompte à 0 % posé en lot, et aucune ligne supprimée en lot sans décision (relecture v1.46a)
+  if (ac === 0) return toast('Acompte par défaut à 0 % : les prochaines dates confirmées n’auront pas d’acompte. Les dates déjà confirmées gardent le leur ; pour en retirer un, « Valider les conditions » de la date › 0 acompte.');
+  if (!(await confirmAsk('Appliquer aux dates à venir ?', `Mettre ${pct(ac)} d’acompte et ${pct(100-ac)} de solde sur les dates à venir dont les conditions ne sont pas validées et dont rien n’est facturé ni saisi à la main. Les artistes qui ont leur propre acompte par défaut gardent le leur.`, `Appliquer ${pct(ac)} / ${pct(100-ac)}`))) return;
   // seulement l'acompte et le solde créés à la confirmation (pas les acomptes ajoutés à la main)
   // dates à venir dont les conditions ne sont pas validées, avec un seul acompte et rien d'envoyé / payé / saisi à la main
-  const now = new Date().toLocaleDateString('sv-SE');
-  const ids = S.db.shows.filter(s => !s.terms_validated_at && s.prod_mode !== 'booking' && (!s.date || s.date >= now)).map(s => s.id).filter(id => {
-    const p = S.db.show_payments.filter(x => x.show_id === id && ['acompte','solde'].includes(x.kind));
+  const now = today();
+  // artiste avec son propre acompte par défaut (v1.59) : ses dates ne suivent pas le réglage général
+  const ownAc = new Set(S.db.projects.filter(p => p.default_acompte_pct != null && p.default_acompte_pct !== '').map(p => p.id));
+  const ids = S.db.shows.filter(s => !s.archived_at && !s.terms_validated_at && s.prod_mode !== 'booking' && !isCoproduction(s) && !ownAc.has(s.project_id) && (!s.date || s.date >= now)).map(s => s.id).filter(id => {   // coproduction : pas d'acompte / solde par défaut (v1.44)
+    const p = paymentsOf(id).filter(x => ['acompte','solde'].includes(x.kind));
     return p.filter(x => x.kind === 'acompte').length === 1 && p.every(x => !isInvoiced(x) && (x.amount == null || x.amount === ''));   // aucune facture émise (§6.4)
   });
   for (const [kind, pct] of [['acompte', ac], ['solde', 100-ac]]){
     for (let i = 0; i < ids.length; i += 100){
-      const {error} = await sb.from('show_payments').update({pct}).eq('kind', kind).is('sent_at', null).is('paid_at', null).is('invoice_number', null).is('pennylane_id', null).is('amount', null).in('show_id', ids.slice(i, i + 100));
+      const {error} = await sb.from('show_payments').update({pct}).eq('kind', kind).is('sent_at', null).is('paid_at', null).is('invoice_number', null).is('pennylane_id', null).is('amount', null).is('hors_calcul', null).in('show_id', ids.slice(i, i + 100));
       if (error) return toast(error.message, true);
     }
   }

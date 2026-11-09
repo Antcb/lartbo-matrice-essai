@@ -2,22 +2,28 @@
  * Formulaires de création / modification : date, projet, tâche, contact, structure, suivi, événement,
  * créations rapides (structure, contact) depuis un champ de recherche, export CSV des suivis, photo de projet.
  */
+import { calCheckBeforeSave, calPanelHTML } from './calendars.js';
+import { ask, askText } from './ui/dialog.js';
 import { FORMAT_FIELD, exportTable } from './exports.js';
 import { propagateCommission } from './commission.js';
+import { allPaymentsOf, hasFinancialRecord, showRemovalState } from './calc.js';
 import { render } from './app.js';
 import { CFG } from './config.js';
 import { CONTACT_ROLES, STRUCT_TAGS, CONFIRMED_PROD, CONTRACTS, EVENT_KINDS, PRICING, PRIORITIES, PRIORITY_OPTS, PROSPECT, PROSPECT_OPTS, STATUSES, TASK_STATUS, TASK_STATUS_OPTS, TEAM_NAMES, TICKETING, isOff } from './constants.js';
-import { insert, refreshFor, remove, removeWhere, save, saveLinger, sb, signedUrl, syncLinks, uploadFiles } from './data.js';
+import { archiveShow, deleteShow, insert, reactivateReminders, purgeStored, refreshFor, remove, removeWhere, save, saveLinger, sb, showDeletionState, signedUrl, syncLinks, uploadFiles } from './data.js';
 import { fillCoords, geocode, geoFrance, searchPlaces } from './geo.js';
-import { contactMails, defaultCommission, suiviClosed, attachmentsOf, byId, deptNames, isDone, eventsOfStructure, setting, lastExchange, linksOfContact, linksOfStructure, projIds, projName, projectOptions, prospectTitle } from './selectors.js';
+import { contactMails, contactsWithMail, defaultCommission, settingAcompte, suiviClosed, attachmentsOf, byId, deptNames, isDone, eventsOfStructure, setting, lastExchange, linksOfContact, linksOfStructure, placeOfSuivi, projIds, showPlaceNote, projName, projectOptions, prospectTitle, spectaclesOf, defaultSpectacleId } from './selectors.js';
 import { S, touch } from './state.js';
 import { CREATORS } from './ui/autocomplete.js';
-import { fileRow } from './ui/bits.js';
+import { fileRow, remindersSuspendedNote } from './ui/bits.js';
+import { remindersOf } from './reminders.js';
 import { hiddenFields, openModal } from './ui/modal.js';
-import { $, downloadCSV, esc, fmtDate, norm, toast, today, workDay } from './utils.js';
+import { $, downloadCSV, esc, fmtDate, norm, toast, today, workDay, addDays, pct } from './utils.js';
 import { driveHTML } from './views/production.js';
-import { cancelAutoRelances, closeNoAnswer } from './prospection.js';
+import { cancelAutoRelances, closeNoAnswer, deleteProspect, prospectDeleteAsk } from './prospection.js';
 import { afterFeeChange, askConfirmation, becameConfirmed } from './confirm-flow.js';
+import { spectFields, spectValue } from './budget-template.js';
+import { deptOf } from './contract.js';
 
 const team = () => CFG.TEAM.map(e=>[e, TEAM_NAMES[e]||e]);
 const activeProjects = keep => projectOptions(true, keep).map(x=>[x.id, x.name]);
@@ -26,11 +32,18 @@ const activeProjects = keep => projectOptions(true, keep).map(x=>[x.id, x.name])
 export function showFields(s){
   return [
     {k:'structure_id', label:'Structure (salle, festival, organisateur)', type:'ac', kind:'structures', create:true, full:true},
-    {k:'venue', label:'Nom du lieu / festival', full:true},
+    // lieu réel (v1.60.2) : choisi parmi les salles / festivals connus (adresse et code postal repris) ou tapé
+    {k:'venue', label:'Nom du lieu / festival', type:'lieu', fill:'', full:true},
     {k:'project_id', label:'Artiste', type:'project'},
+    {k:'spectacle_id', label:'Spectacle', type:'select', blank:false, options: spectacleOptions(s.project_id, s.spectacle_id)},
     {k:'status', label:'Statut', type:'select', options:STATUSES.includes(s.status)||!s.status ? STATUSES : [s.status, ...STATUSES], blank:false},
     {k:'date', label:'Date', type:'date'}, {k:'date_end', label:'Fin (si plusieurs jours)', type:'date'},
+    {k:'address', label:'Adresse du lieu', type:'place', fill:'', full:true, placeholder:'Taper l’adresse du lieu (facultatif)'},
+    {k:'postal_code', label:'Code postal'},
     {k:'city', label:'Ville', type:'city', fill:''}, {k:'department', label:'Département (ou pays)', placeholder:'ex. 69, CH, BE'},
+    // décision d'Anthony du 07/11/2026 : l'adresse de la structure n'est le lieu de la date que sur ce choix explicite (sinon : à compléter)
+    {k:'venue_is_structure', label:'Utiliser l’adresse de la structure comme lieu de représentation', type:'checkbox', full:true},
+    {k:'_h_place', type:'html', full:true, html:`<p class="help m0" data-place-note>${esc(placeHelp(s))}</p>`},
     {k:'contract_type', label:'Type de contrat', type:'select', options:CONTRACTS},
     {k:'fee_ht', label:'Cachet HT (€)', type:'number'},
     {k:'ticketing_type', label:'Billetterie', type:'select', options:TICKETING},
@@ -42,27 +55,164 @@ export function showFields(s){
   ];
 }
 
-/** Valeurs d'une nouvelle date posée depuis une structure : ville et département de la fiche (pas de l'adresse administrative) */
-export const showPrefillFromStructure = st => st ? {structure_id: st.id, venue: st.name, city: st.city || null, department: st.department_code || (st.country && st.country!=='France' ? st.country : null), lat: st.lat, lng: st.lng} : {};
+/** Spectacles proposés pour une date (v1.57) : ceux de l'artiste encore actifs, plus celui déjà choisi ; « non précisé » toujours possible
+ *  pour une date existante (jamais d'attribution automatique) */
+export function spectacleOptions(projectId, current){
+  const list = spectaclesOf(projectId).filter(x => x.active || x.id === current);
+  return [['', list.length ? '— choisir le spectacle —' : 'Non précisé (aucun spectacle pour cet artiste)'], ...list.map(x => [x.id, x.name + (x.active ? '' : ' (inactif)')])];
+}
+
+/** Nouveau spectacle d'un artiste : nom et budget type dès la création (v1.57) ; montants vides = non renseignés */
+export function newSpectacle(projectId){
+  const nums = spectFields().map(([k, label]) => ({k, label, type: 'text', placeholder: 'vide = non renseigné'}));
+  return openModal({title: `Nouveau spectacle · ${projName(projectId)}`, values: {},
+    fields: [{k: 'name', label: 'Nom du spectacle (ex. « Jeune public »)', full: true}, ...nums],
+    onSave: async v => {
+      if (!v.name){ toast('Indique le nom du spectacle', true); return false; }
+      const t = {};
+      for (const [k, label] of spectFields()){ const r = spectValue(v[k]); if (!r.ok){ toast(`${label} : nombre positif ou vide`, true); return false; } if (r.v != null) t[k] = r.v; }
+      const sort = Math.max(0, ...spectaclesOf(projectId).map(x => x.sort || 0)) + 1;
+      const row = await insert('spectacles', {project_id: projectId, name: v.name, active: true, budget_template: t, sort});
+      if (row){ S.tab['fold:spectacle-' + row.id] = true; toast('Spectacle créé'); }
+      return row;
+    }});
+}
+
+/** Valeurs d'une nouvelle date posée depuis une structure : l'organisateur et son nom comme nom du lieu, rien d'autre (décisions du
+ *  07/11/2026 : adresse, code postal, ville, département et coordonnées suivent la source du lieu — la structure seulement si elle
+ *  est confirmée comme lieu, case de la date) */
+export const showPrefillFromStructure = st => st ? {structure_id: st.id, venue: st.name} : {};
+/** Texte d'aide sous la case « Utiliser l'adresse de la structure… » : où en est la localisation de la date */
+function placeHelp(s){
+  const note = s?.id ? showPlaceNote(s) : '';
+  return (note ? note + '. ' : '') + 'Sans lieu choisi, adresse propre ou cette case (cochée aussi en choisissant la structure elle-même comme lieu), l’adresse, le code postal et la ville du lieu restent à compléter dans la fiche, le contrat et les mails.';
+}
+/** Nouvelle date posée depuis un suivi (v1.60.2) : le lieu choisi dans le suivi s'il y en a un, sinon celui de sa structure */
+export const showPrefillFromSuivi = (p, st) => { const pl = placeOfSuivi(p);
+  return pl ? {structure_id: st?.id || null, ...pl, venue: pl.venue || st?.name || null} : showPrefillFromStructure(st); };
+
+/** Coordonnées d'une date à l'enregistrement (v1.60.2) : un lieu ou une adresse choisis dans la fenêtre gardent les leurs ;
+ *  un emplacement changé à la main est relocalisé (adresse complète si elle est connue) ; les coordonnées de la structure ne sont
+ *  copiées sur la date que si la case « Utiliser l'adresse de la structure… » est cochée (07/11/2026) — sinon rien n'est écrit et la
+ *  carte garde le repère de la structure comme localisation héritée (showPlace). Coordonnées déjà enregistrées : jamais effacées
+ *  sans changement du lieu. Le département suit le code postal (règle {{cp}}, deptOf). */
+async function locateShow(v, s){
+  const st = byId('structures', v.structure_id);
+  const french = d => !d || /^(\d{2,3}|2[AB])$/i.test(String(d).trim());
+  // département vide : tiré du code postal seulement pour un lieu en France (structure en France ou sans pays) — jamais d'Aube pour Berlin 10115
+  const inFrance = v.department ? french(v.department) : !st || !st.country || /^\s*france\s*$/i.test(st.country);
+  if (/^\d{5}$/.test(String(v.postal_code || '').replace(/\s/g, '')) && inFrance && (!v.department || v.postal_code !== s.postal_code))
+    v.department = deptOf(v.postal_code, '');
+  const moved = ['address', 'postal_code', 'city'].some(k => (v[k] || '') !== (s[k] || ''));
+  if (v.lat != null && v.lat !== s.lat) return;   // coordonnées du lieu / de l'adresse choisis
+  if (!moved){
+    if (v.lat != null) return;
+    // lieu inchangé (adresse, code postal, ville, organisateur, case « adresse de la structure ») : RIEN n'est écrit — une ancienne
+    // date garde son repère hérité (« lieu à confirmer »), jamais déplacée ni géocodée d'office (décision du 07/11, relecture v1.60.2)
+    if ((v.structure_id || null) === (s.structure_id || null) && !!v.venue_is_structure === !!s.venue_is_structure) return;
+    // rien n'a bougé et la structure, dans la même ville, sert déjà de repère (showCoords) : rien n'est écrit sur la date
+    if (st && st.lat != null && (!v.city || !st.city || norm(v.city) === norm(st.city))) return;
+  }
+  v.lat = v.lng = null;
+  if (st && st.lat != null && !v.address && (!v.city || norm(v.city) === norm(st.city || ''))){
+    // structure confirmée comme lieu : ses coordonnées ; sinon rien de l'organisateur (repère hérité « lieu à confirmer »)
+    if (v.venue_is_structure){ v.lat = st.lat; v.lng = st.lng; }
+    return;
+  }
+  const fr = !v.department || french(v.department);
+  await fillCoords(v, [v.address, v.postal_code, v.city, fr ? 'France' : v.department].filter(Boolean).join(' '));
+}
+
+/**
+ * Question de suppression d'une date (v1.60.3) : ce qui part et ce qui reste, d'après le serveur (show_deletion_state) — à défaut
+ * (serveur sans la fonction), d'après les données chargées. Suppression refusée : motif affiché (null) ; si l'archivage reste
+ * possible (devis ou document Pennylane, lignes hors calcul…), la question propose « Archiver la date » à la place
+ * (réponse d'Anthony du 07/11 : distinct d'une annulation, aucun document Pennylane touché).
+ */
+async function showDeleteAsk(s){
+  const name = [s.date ? fmtDate(s.date) : 'sans date', s.venue].filter(Boolean).join(' · ');
+  const loc = showRemovalState(s.id);
+  const st = loc.blocked.length ? null : await showDeletionState(s.id);
+  const blocked = loc.blocked.length ? loc.blocked : st?.blocked || [];
+  if (blocked.length){
+    const arch = loc.blocked.length ? loc.archiveBlocked : st?.archive_blocked || blocked;
+    if (arch.length){ toast(blocked.join(' '), true); return null; }
+    return {title: 'Supprimer la date ?', text: [`La date « ${name} » ne peut pas être supprimée :`, ...blocked,
+      'Tu peux l’archiver à la place : elle sort des listes de travail, des relances, de la carte et des calendriers, et sa fiche publique se ferme. Ses montants restent dans les vues financières et les comptes. Elle reste consultable dans Booking › « Dates archivées », où elle se restaure.',
+      'Ce n’est ni une annulation (son statut ne change pas) ni une suppression. Rien n’est modifié ni supprimé dans Pennylane.',
+      'Si une facture est un jour faite dans Pennylane pour cette date, elle lui reste rattachée et une alerte apparaît dans les notifications.'].join('\n'),
+      actions: [{value: 'archive', label: 'Archiver la date'}]};
+  }
+  const nb = (k, one, many) => `${k} ${k > 1 ? many : one}`;
+  const pays = st ? Number(st.payments) : allPaymentsOf(s.id).length, lines = st ? Number(st.budget_lines) : S.db.budget_lines.filter(l => l.show_id === s.id).length;
+  const tasks = st ? Number(st.tasks) : S.db.tasks.filter(t => t.show_id === s.id).length, closures = Number(st?.closures || 0);
+  const gone = [pays && nb(pays, 'ligne de facturation (non émise)', 'lignes de facturation (aucune émise)'), lines && nb(lines, 'ligne de budget', 'lignes de budget')].filter(Boolean);
+  const text = [
+    `Supprimer la date « ${name} » ?`,
+    `Supprimées avec elle : ${gone.length ? gone.join(' et ') : 'aucune ligne de facturation ni de budget'}.`,
+    tasks ? `Conservée${tasks > 1 ? 's' : ''} : ${nb(tasks, 'tâche liée', 'tâches liées')}, détachée${tasks > 1 ? 's' : ''} de la date${st ? ', avec la mention « Date supprimée le … » en tête de leur note' : ''}.` : '',
+    closures ? `Historique de clôture et de réouverture du résultat (${nb(closures, 'entrée', 'entrées')}) : conservé dans le journal des suppressions, avec une copie complète de la date.`
+      : st ? 'Une copie complète de la date est gardée dans le journal des suppressions.' : '',
+    'Rien n’est supprimé dans Pennylane ; le dossier Google Drive n’est pas touché.'];
+  return {title: 'Supprimer la date ?', text: text.filter(Boolean).join('\n'), actions: [{value: 'del', label: 'Supprimer la date', danger: true}]};
+}
+/** Suppression (choix « del ») ou archivage (choix « archive », motif demandé) d'une date depuis sa fenêtre */
+async function showRemove(id, choice){
+  if (choice === 'archive'){
+    const reason = await askText({title: 'Archiver la date ?', text: 'La date sort des listes de travail, des relances, de la carte et des calendriers ; sa fiche publique se ferme ; ses montants restent comptés. Son statut ne change pas. Le motif est gardé avec elle.', label: 'Motif de l’archivage', ok: 'Archiver la date'});
+    if (!reason) return false;
+    const ok = await archiveShow(id, reason);
+    if (ok) toast('Date archivée : elle reste consultable dans Booking › « Dates archivées »');
+    return ok;
+  }
+  const r = await deleteShow(id);
+  if (r && typeof r === 'object') toast(`Date supprimée${r.tasks ? ` ; ${r.tasks > 1 ? `${r.tasks} tâches gardées` : '1 tâche gardée'}, avec la mention « Date supprimée » dans la note` : ''}`);
+  return r;
+}
+
+/**
+ * « Réactiver les relances » d'une date restaurée (v1.60.3, décision d'Anthony du 07/11) : une prochaine échéance par relance
+ * concernée (proposée : l'échéance d'origine, ou aujourd'hui si elle est passée ; jamais avant aujourd'hui). Échéances d'origine
+ * intactes ; la relance ne part ni avant la date choisie ni avant son échéance d'origine. Tracé côté serveur.
+ */
+export function reactivateRemindersWindow(id, level = 1){
+  const s = byId('shows', id); if (!s) return;
+  const now = today(), groups = new Map();
+  for (const r of remindersOf(s, {all: true})){ const g = groups.get(r.key) || {titles: [], origin: r.origin}; g.titles.push(r.title); if (r.origin < g.origin) g.origin = r.origin; groups.set(r.key, g); }
+  const keys = [...groups.keys()], values = Object.fromEntries(keys.map(k => [k, groups.get(k).origin > now ? groups.get(k).origin : now]));
+  const fields = keys.map(k => ({k, type: 'date', full: true, label: `${[...new Set(groups.get(k).titles)].join(' · ')} — échéance d’origine : ${fmtDate(groups.get(k).origin)}`}));
+  return openModal({level, title: 'Réactiver les relances', saveLabel: 'Réactiver les relances', values, fields,
+    extraTop: `<p class="help full">${esc([s.date ? fmtDate(s.date) : 'sans date', s.venue].filter(Boolean).join(' · '))} : choisis la prochaine échéance de chaque relance. Les échéances d’origine ne changent pas ; une relance ne part ni avant la date choisie, ni avant son échéance d’origine.${keys.length ? '' : ' Aucune relance n’est en cours pour cette date : les prochaines suivront leurs échéances d’origine.'}</p>`,
+    onSave: async v => {
+      for (const k of keys){ if (!v[k]){ toast('Choisis la prochaine échéance de chaque relance', true); return false; }
+        if (v[k] < now){ toast('Choisis une prochaine échéance à partir d’aujourd’hui', true); return false; } }
+      const ok = await reactivateReminders(id, Object.fromEntries(keys.map(k => [k, v[k]])));
+      if (ok) toast('Relances réactivées');
+      return ok;
+    }});
+}
 
 export function editShow(id, projectId, prefill={}){
   const s = id ? byId('shows', id) : {status:'Intérêt Salle', contract_type:'Cession', project_id: projectId||S.project||null, communication_enabled:true, date:null, ...prefill};
+  // nouvelle date : spectacle présélectionné (seul actif, sinon celui par défaut de l'artiste), toujours modifiable (v1.60.3)
+  if (!id && !s.spectacle_id && s.project_id) s.spectacle_id = defaultSpectacleId(s.project_id) || null;
   const extra = hiddenFields(s, [['lat',1],['lng',1],['prospect_id']])
     + (id && s.structure_id ? `<div class="full"><button type="button" class="btn sm" data-act="openStructure" data-id="${s.structure_id}">Ouvrir la fiche structure et son suivi</button></div>` : '')
-    + (id && s.status?.startsWith('Confirmée') ? `<div class="full drive">${driveHTML(s)}</div>` : '');
+    + (id && s.status?.startsWith('Confirmée') ? `<div class="full drive">${driveHTML(s)}</div>` : '')
+    + remindersSuspendedNote(s, 2);   // relances suspendues après restauration (v1.60.3) : réactivation dans une 2e fenêtre
   const p = openModal({
     title: id ? s.venue : 'Nouvelle date', fields: showFields(s), values: s, extra,
-    onDelete: id ? () => remove('shows', id) : null,
+    deleteAsk: () => showDeleteAsk(s),
+    onDelete: id ? choice => showRemove(id, choice) : null,
     onSave: async v => {
       if (!v.venue) { toast('Indique le nom du lieu ou du festival', true); return false; }
       if (!v.project_id) { toast('Choisis l’artiste', true); return false; }
-      const st = byId('structures', v.structure_id);
-      if (!v.city && st) v.city = st.city;
-      const placeChanged = !id || v.city!==s.city || v.structure_id!==s.structure_id;
-      if (placeChanged && (v.lat==null || v.city!==s.city)){
-        if (st && st.lat!=null && (!v.city || v.city===st.city)){ v.lat=st.lat; v.lng=st.lng; v.department = v.department || st.department_code; }
-        else if (v.lat==null || v.city!==s.city){ v.lat=null; v.lng=null; await fillCoords(v, [v.city, v.department && /^\d/.test(v.department) ? 'France' : ''].filter(Boolean).join(', ')); }
-      }
+      // spectacle (v1.57) : il doit appartenir à l'artiste de la date ; une nouvelle date d'un artiste qui a des spectacles en demande un
+      if (v.spectacle_id && byId('spectacles', v.spectacle_id)?.project_id !== v.project_id) { toast('Ce spectacle n’est pas celui de cet artiste : choisis-en un autre', true); return false; }
+      if (!id && !v.spectacle_id && spectaclesOf(v.project_id).some(x => x.active)) { toast('Choisis le spectacle de cette date', true); return false; }
+      await locateShow(v, s);
+      // agenda Google de l'artiste : chevauchement avec une indisponibilité (ou agenda plus à jour) → avertissement, poursuite possible
+      if (!(await calCheckBeforeSave(v, id ? s : null))) return false;
       const before = s.status, wasOff = isOff(before), nowOff = isOff(v.status), oldFee = s.fee_ht;
       let showId = id, ok = true;
       if (id){
@@ -75,20 +225,38 @@ export function editShow(id, projectId, prefill={}){
       if (becameConfirmed(before, v.status)) setTimeout(() => askConfirmation(showId), 80);
     }
   });
-  // Choix d'une structure → nom du lieu, ville et département repris de sa fiche
+  // Choix d'une structure (organisateur) → son nom comme lieu si le nom est vide, rien d'autre : ni adresse, code postal, ville,
+  // département ni coordonnées (décisions du 07/11/2026 : la structure n'est le lieu que sur confirmation).
+  // La structure elle-même choisie dans la liste « Lieu » vaut confirmation : la case « Utiliser l'adresse de la structure… » est
+  // cochée quand ce lieu est aussi l'organisateur de la date (choisi avant ou après) ; un autre lieu choisi ensuite la décoche.
   const dlg = $('#modal');
+  let placeStructure = null, autoChecked = false;
   const onChosen = e => {
-    const box = e.target.closest('.ac'); if (!box || box.querySelector('.ac-val').name !== 'structure_id') return;
+    const box = e.target.closest('.ac'); if (!box) return;
+    const name = box.querySelector('.ac-val').name;
+    const f = dlg.querySelector('form').elements, box2 = f.venue_is_structure;
+    const sync = () => { if (!box2) return; const on = !!placeStructure && placeStructure === (f.structure_id?.value || null);
+      if (on && !box2.checked){ box2.checked = true; autoChecked = true; } else if (!on && autoChecked){ box2.checked = false; autoChecked = false; } };
+    if (name === 'venue'){ placeStructure = e.detail?.place_structure || null; sync(); return; }
+    if (name !== 'structure_id') return;
     const st = byId('structures', e.detail.id); if (!st) return;
-    const f = dlg.querySelector('form').elements;
     const pre = showPrefillFromStructure(st);
-    if (!f.venue.value) f.venue.value = pre.venue;
-    if (pre.city){ f.city.value = pre.city; const ci = f.city.closest('.ac')?.querySelector('.ac-input'); if (ci) ci.value = pre.city; }
-    if (pre.department) f.department.value = pre.department;
-    if (f.lat){ f.lat.value = st.lat ?? ''; f.lng.value = st.lng ?? ''; }
+    const put = (k, v) => { const el = f[k]; if (!el) return; el.value = v ?? ''; const vis = el.closest('.ac')?.querySelector('.ac-input'); if (vis) vis.value = v ?? ''; };
+    if (!f.venue.value) put('venue', pre.venue);
+    sync();
   };
   dlg.addEventListener('ac-chosen', onChosen);
-  dlg.addEventListener('close', () => dlg.removeEventListener('ac-chosen', onChosen), {once:true});
+  // autre artiste choisi → ses spectacles (v1.57) ; le spectacle choisi reste seulement s'il est aussi le sien
+  const onProject = e => {
+    if (e.target.id !== 'fld-project_id') return;
+    const sel = dlg.querySelector('#fld-spectacle_id'); if (!sel) return;
+    const cur = sel.value;
+    sel.innerHTML = spectacleOptions(e.target.value, null).map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join('');
+    if (cur && [...sel.options].some(o => o.value === cur)) sel.value = cur;
+    else if (!id) sel.value = defaultSpectacleId(e.target.value);   // nouvelle date sans spectacle valable : présélection du nouvel artiste (v1.60.3)
+  };
+  dlg.addEventListener('change', onProject);
+  dlg.addEventListener('close', () => { dlg.removeEventListener('ac-chosen', onChosen); dlg.removeEventListener('change', onProject); }, {once:true});
   return p;
 }
 
@@ -99,8 +267,9 @@ export function editProject(id){
     fields: [
       {k:'name', label:'Nom', full:true}, {k:'active', label:'Projet actif', type:'checkbox'},
       {k:'mode', label:'Type de suivi', type:'select', blank:false, options:[['production','Production (L’ArtBo produit les dates)'],['booking','Booking seul (commission facturée à l’artiste)']],
-        help:'Le changement s’applique aux nouvelles dates ; les dates existantes gardent leur suivi.'},
-      {k:'default_artbo_pct', label:"Commission L'ArtBo (%)", type:'number', help:'Par défaut : booking ' + defaultCommission('booking') + ' %, production ' + defaultCommission('production') + ' % (Réglages › Pourcentages par défaut).'},
+        help:'Les dates existantes suivent, sauf celles réglées à la main et celles qui ont des opérations financières enregistrées (facture, versement, numéro, lien Pennylane).'},
+      {k:'default_artbo_pct', label:"Commission L'ArtBo (%)", type:'number', help:'Par défaut : booking ' + pct(defaultCommission('booking')) + ', production ' + pct(defaultCommission('production')) + ' (Réglages › Pourcentages par défaut).'},
+      {k:'default_acompte_pct', label:'Acompte par défaut (% du cachet)', type:'number', placeholder: String(settingAcompte()), help:'Vide : Réglages (' + pct(settingAcompte()) + '). 0 : sans acompte. Une date garde l’acompte posé sur elle ; s’applique aux prochaines dates confirmées.'},
       {k:'default_partner_id', label:'Co-producteur par défaut', type:'select', options:S.db.partners.map(x=>[x.id,x.name])},
       {k:'default_partner_pct', label:'% partenaire sur la commission', type:'number'},
       ...(p.drive_artist_folder_id ? [] : [{k:'_make_folder', label:'Créer son dossier Drive à son nom (à partir du modèle artiste)', type:'checkbox', full:true}]),
@@ -114,10 +283,14 @@ export function editProject(id){
       {k:'contract_template_cc', label:'Contrat de cession', full:true, placeholder:'https://docs.google.com/document/d/…'},
       {k:'contract_template_cr', label:'Contrat de co-réalisation', full:true, placeholder:'https://docs.google.com/document/d/…'},
       {k:'notes', label:'Notes', type:'textarea', full:true},
+      ...(id ? [{k:'_h_cal', type:'html', full:true, html:`<h3 class="block-title mt-sm">Agenda Google (lecture seule)</h3>${calPanelHTML(id)}`}] : []),
     ],
+    deleteAsk: () => ({title: 'Supprimer l’artiste ?', text: `Supprimer l’artiste « ${p.name || ''} » de la Matrice ?\nSes lignes de budget et ses modèles de mail propres sont supprimés avec lui ; ses dates, suivis et tâches restent, sans artiste.\nSes membres et son journal (échanges et pièces jointes) restent en base mais ne s’affichent plus nulle part.\nSes dossiers et fichiers Google Drive ne sont pas touchés.`,
+      actions: [{value: 'del', label: 'Supprimer l’artiste', danger: true}]}),
     onDelete: id ? () => deleteProject(id) : null,
     onSave: async v => {
       if (!v.name) return false;
+      if (v.default_acompte_pct != null && v.default_acompte_pct !== '' && !(Number(v.default_acompte_pct) >= 0 && Number(v.default_acompte_pct) <= 100)){ toast('L’acompte doit être entre 0 et 100 %', true); return false; }
       const makeFolder = v._make_folder; delete v._make_folder;
       if (v.drive_artist_folder_id) v.drive_artist_folder_id = driveId(v.drive_artist_folder_id);
       ['contract_template_cc','contract_template_cr'].forEach(k => { if (v[k]) v[k] = (String(v[k]).match(/[-\w]{25,}/) || [v[k]])[0]; });
@@ -128,6 +301,9 @@ export function editProject(id){
         if (ok && v.mode && v.mode !== prevMode){   // la base a mis à jour les dates (et ajouté acomptes / soldes en production) : on recharge
           const ids = S.db.shows.filter(x => x.project_id === id).map(x => x.id);
           await refreshFor('shows', 'project_id', id); await refreshFor('show_payments', 'show_id', ids); render();
+          // dates engagées (opérations financières enregistrées) : elles gardent leur mode — dit clairement (lot D1)
+          const kept = S.db.shows.filter(x => x.project_id === id && !x.prod_mode_manual && (x.prod_mode || 'production') !== v.mode && hasFinancialRecord(x.id));
+          if (kept.length) toast(`${kept.length} date${kept.length > 1 ? 's gardent leur' : ' garde son'} mode (${kept.length > 1 ? 'elles ont' : 'elle a'} des opérations financières enregistrées) : ${kept.map(x => x.venue || '').slice(0, 5).join(', ')}${kept.length > 5 ? '…' : ''}.`);
         }
         return; }
       const row = await insert('projects', v);
@@ -136,9 +312,9 @@ export function editProject(id){
     }
   });
   // le type de suivi change : la commission suit (booking / production) tant qu'elle est celle par défaut
-  const modeSel = document.querySelector('#modal [name=mode]'), pct = document.querySelector('#modal [name=default_artbo_pct]');
-  if (modeSel && pct){ let prev = modeSel.value;
-    modeSel.addEventListener('change', () => { if (pct.value === '' || Number(pct.value) === defaultCommission(prev)) pct.value = defaultCommission(modeSel.value); prev = modeSel.value; }); }
+  const modeSel = document.querySelector('#modal [name=mode]'), pctIn = document.querySelector('#modal [name=default_artbo_pct]');
+  if (modeSel && pctIn){ let prev = modeSel.value;
+    modeSel.addEventListener('change', () => { if (pctIn.value === '' || Number(pctIn.value) === defaultCommission(prev)) pctIn.value = defaultCommission(modeSel.value); prev = modeSel.value; }); }
 }
 
 /** Dossier Drive d'un artiste (créé depuis le modèle s'il n'existe pas encore) */
@@ -165,7 +341,7 @@ export const driveId = s => { const m = String(s).match(/folders\/([\w-]{10,})/)
 /** Tâche Booking : à réaliser sous 10 jours par défaut */
 const BOOKING_DAYS = 10;
 // échéance à J+n, décalée au lundi si elle tombe un samedi ou un dimanche
-const inDays = n => { const d = new Date(); d.setDate(d.getDate() + n); return workDay(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`); };
+const inDays = n => workDay(addDays(today(), n));   // fonctions officielles (§1.6), jour de Paris
 
 /** Suivis proposés pour une tâche : ceux de sa structure d'abord, puis les autres suivis ouverts */
 function suiviOptions(t){
@@ -194,17 +370,35 @@ export function editTask(id, prefill={}){
       ...(files.length ? [{k:'_existing', type:'html', label:'Pièces jointes', full:true, html: files.map(f=>fileRow(f, 'openAttachment', 'delAttachment')).join('')}] : []),
       {k:'_files', label: files.length ? 'Ajouter des pièces jointes' : 'Pièces jointes', type:'files', full:true},
     ],
-    onDelete: id ? async () => {
-      const closeIt = t.auto_kind === 'relance_tel' && t.prospect_id && !isDone(t) && confirm('Relance téléphone supprimée : pas de réponse, on clôt le suivi ? (Annuler = supprimer seulement la tâche)');
-      if (closeIt) await closeNoAnswer(id, {deleted:true});
-      await removeWhere('attachments', 'task_id', id); return remove('tasks', id); } : null,
+    // suppression (Q20, v1.46b) : « Annuler » ne supprime jamais rien ; une relance téléphone ouverte propose deux issues nommées
+    deleteAsk: id ? () => {
+      const n = attachmentsOf('task_id', id).length, phone = t.auto_kind === 'relance_tel' && t.prospect_id && !isDone(t);
+      return {title: 'Supprimer la tâche ?', text: `Supprimer la tâche « ${t.title || 'sans titre'} »${n ? ` et ${n > 1 ? `ses ${n} pièces jointes` : 'sa pièce jointe'}` : ''} ?`
+          + (phone ? '\nRelance téléphone sans réponse : tu peux aussi clore le suivi (noté dans son journal).' : ''),
+        actions: phone ? [{value: 'task', label: 'Supprimer seulement la tâche', danger: true}, {value: 'close', label: 'Supprimer et clore le suivi', danger: true}]
+          : [{value: 'task', label: 'Supprimer la tâche', danger: true}]};
+    } : null,
+    onDelete: id ? async choice => {
+      if (choice === 'close') await closeNoAnswer(id, {deleted:true});
+      const paths = attachmentsOf('task_id', id).map(f => f.path);
+      if (!(await remove('tasks', id))) return false;
+      await removeWhere('attachments', 'task_id', id);
+      await purgeStored(paths);   // fichiers des pièces jointes effacés avec la tâche (§4.4)
+      return true; } : null,
     onSave: async v => {
       if (!v.title){ toast('Donne un nom à la tâche', true); return false; }
       v.prospect_id = v.prospect_id || null;
       const up = v._files || []; delete v._files; delete v._existing;
       v.project_id = v.project_ids[0] || null;
+      // date et heure réelles de réalisation (Q17, v1.46b) : posées en passant à « Faite » / « Annulée », effacées en revenant « À faire »
+      const cur = id ? byId('tasks', id) : null, wasDone = !!cur && isDone(cur), nowDone = isDone(v);   // état actuel (mise à jour en direct comprise)
+      if (nowDone && !wasDone) v.done_at = new Date().toISOString();
+      else if (!nowDone && wasDone) v.done_at = null;
       let row = {id};
-      if (id) await save('tasks', id, v, {rerender:false}); else row = await insert('tasks', v);
+      if (id && nowDone && !wasDone){   // terminée depuis la fenêtre : 5 s pour annuler, comme la case (§4.3)
+        if (!(await saveLinger('tasks', id, v, v.status === 'Cancelled' ? 'Tâche annulée' : 'Tâche terminée'))) return false;
+      } else if (id){ if (!(await save('tasks', id, v, {rerender:false}))) return false; }
+      else row = await insert('tasks', v);
       if (row && up.length) await uploadFiles({task_id: row.id}, up);
     }
   });
@@ -221,6 +415,15 @@ export function editTask(id, prefill={}){
 }
 
 /* ------------------------------------------------------------------ Contacts */
+/** Doublon par mail : null (aucun), 'save' (enregistrer quand même), 'cancel' (rester dans la fenêtre) ou le contact existant choisi */
+async function askDuplicate(v, id, openLabel){
+  const dups = contactsWithMail([v.email, v.email_2], id); if (!dups.length) return null;
+  const d = dups[0], st = linksOfContact(d.id).map(s => s.name).filter(Boolean).join(', ');
+  const mail = [v.email, v.email_2].find(m => m && [d.email, d.email_2].some(x => String(x || '').trim().toLowerCase() === String(m).trim().toLowerCase()));
+  const r = await ask({title: 'Contact déjà présent', text: `Le mail ${mail} est déjà celui de « ${d.display_name || [d.first_name, d.last_name].filter(Boolean).join(' ') || 'contact sans nom'} »${st ? ` (${st})` : ''}${dups.length > 1 ? ` et de ${dups.length - 1} autre${dups.length > 2 ? 's' : ''} contact${dups.length > 2 ? 's' : ''}` : ''}.\nAucune fusion n’est faite : tu peux ouvrir la fiche existante, ou enregistrer quand même un second contact.${openLabel === 'Ouvrir la fiche existante' ? '\nEn ouvrant la fiche existante, ce que tu viens de saisir ici n’est pas enregistré.' : ''}`,
+    actions: [{value: 'open', label: openLabel}, {value: 'save', label: 'Enregistrer quand même'}]});
+  return r === 'open' ? d : r === 'save' ? 'save' : 'cancel';
+}
 /** Coordonnées d'un contact : les mêmes cases partout où l'on crée ou modifie une personne (les 2 mails partent dans Brevo) */
 const CONTACT_COORDS = [
   {k:'email', label:'Mail', type:'email'}, {k:'email_2', label:'Mail 2', type:'email'},
@@ -229,8 +432,8 @@ const CONTACT_COORDS = [
 export function editContact(id, prefill={}){
   const c = id ? byId('contacts', id) : {...prefill};
   const links = id ? linksOfContact(id).map(s=>s.id) : (prefill._structures || []);
-  const brevo = !id || !setting('brevo_api_key') ? '' : c.brevo_error ? `<p class="help full" style="color:var(--danger)">Brevo : ${esc(c.brevo_error)}</p>`
-    : c.brevo_at ? `<p class="help full">Dans Brevo (mis à jour le ${fmtDate(c.brevo_at.slice(0,10))}).</p>` : '';
+  const brevo = !id ? '' : c.brevo_error ? `<p class="help full" style="color:var(--danger)">Brevo : ${esc(c.brevo_error)}</p>`
+    : c.brevo_at ? `<p class="help full">Dans Brevo (mis à jour le ${fmtDate(c.brevo_at)}).</p>` : '';
   return openModal({ title: id ? c.display_name : 'Nouveau contact', values: {...c, _structures: links}, extra: brevo,
     fields: [
       {k:'first_name', label:'Prénom'}, {k:'last_name', label:'Nom'},
@@ -239,11 +442,20 @@ export function editContact(id, prefill={}){
       ...CONTACT_COORDS,
       {k:'notes', label:'Notes', type:'textarea', full:true},
     ],
+    deleteAsk: () => ({title: 'Supprimer le contact ?', text: `Supprimer le contact « ${c.display_name || [c.first_name, c.last_name].filter(Boolean).join(' ') || 'sans nom'} » et ses liens avec les structures ? Les dates, suivis et échanges qui le citaient restent, sans contact. Il n’est pas retiré de Brevo.`,
+      actions: [{value: 'del', label: 'Supprimer le contact', danger: true}]}),
     onDelete: id ? () => remove('contacts', id) : null,
     onSave: async v => {
       const ids = v._structures; delete v._structures;
       v.display_name = [v.first_name, v.last_name].filter(Boolean).join(' ') || c.display_name || v.email || v.email_2;
       if (!v.display_name){ toast('Indique au moins un nom', true); return false; }
+      // doublon par mail (décisions du 27/10) : avertissement et accès à la fiche existante ; jamais de fusion automatique.
+      // Seulement à la création, ou pour une adresse ajoutée / modifiée : changer le téléphone ou les notes ne le refait pas.
+      const key = m => String(m || '').trim().toLowerCase(), before = id ? [c.email, c.email_2].map(key) : [];
+      const fresh = [v.email, v.email_2].filter(m => key(m) && !before.includes(key(m)));
+      const dup = fresh.length ? await askDuplicate({email: fresh[0], email_2: fresh[1] || null}, id, 'Ouvrir la fiche existante') : null;
+      if (dup === 'cancel') return false;
+      if (dup && dup !== 'save'){ setTimeout(() => editContact(dup.id), 0); return null; }   // la fenêtre se ferme sans rien enregistrer, la fiche existante s'ouvre
       let row; if (id){ await save('contacts', id, v, {rerender:false}); row={id}; } else row = await insert('contacts', v);
       if (row) await syncLinks('contact', row.id, ids);
       return row;
@@ -313,6 +525,8 @@ export function editStructure(id){
   const links = id ? linksOfStructure(id).map(c=>c.id) : [];
   openModal({ title: id ? s.name : 'Nouvelle structure', values: {...s, _contacts: links}, extra: structHidden(s),
     fields: structFormFields(!id),
+    deleteAsk: () => ({title: 'Supprimer la structure ?', text: `Supprimer la structure « ${byId('structures', id)?.name || ''} » ? Ses liens avec les contacts sont retirés ; les dates, suivis et tâches liés restent, sans structure. Ses événements (festivals, saisons) restent en base mais ne s’affichent plus.`,
+      actions: [{value: 'del', label: 'Supprimer la structure', danger: true}]}),
     onDelete: id ? () => remove('structures', id) : null,
     onSave: async v => { const row = await saveStructure(id, s, v); if (!row) return false;
       // nouvelle structure : sa fiche s'ouvre une fois la fenêtre fermée
@@ -358,17 +572,22 @@ CREATORS.contacts = async name => {
   const [first, ...rest] = String(name).trim().split(/\s+/);
   const row = await openModal({ level:2, title:'Nouveau contact', values:{first_name:first, last_name:rest.join(' ')}, saveLabel:'Créer le contact',
     fields:[{k:'first_name', label:'Prénom'}, {k:'last_name', label:'Nom'}, {k:'roles', label:'Poste(s)', type:'tags', full:true, suggest: () => [...CONTACT_ROLES, ...S.db.contacts.flatMap(x => x.roles || [])]}, ...CONTACT_COORDS],
-    onSave: async v => { v.display_name = [v.first_name, v.last_name].filter(Boolean).join(' ') || v.email || v.email_2; if (!v.display_name){ toast('Indique au moins un nom', true); return false; } return await insert('contacts', v); } });
+    onSave: async v => { v.display_name = [v.first_name, v.last_name].filter(Boolean).join(' ') || v.email || v.email_2; if (!v.display_name){ toast('Indique au moins un nom', true); return false; }
+      // doublon par mail : on peut reprendre le contact existant au lieu d'en créer un second (aucune fusion automatique)
+      const dup = await askDuplicate(v, null, 'Utiliser ce contact');
+      if (dup === 'cancel') return false;
+      if (dup && dup !== 'save') return dup;
+      return await insert('contacts', v); } });
   if (!row) return null;
   return {id: row.id, label: row.display_name};
 };
 
 /* ------------------------------------------------------------------ Suivis */
 export function editProspect(id){
-  const p = id ? byId('prospects', id) : {status:'Mailed', project_ids: S.project && byId('projects',S.project)?.active ? [S.project] : [], name:'Suivi', structure_id:S.newSuiviStructure||null, last_contact: today()};
+  const p = id ? byId('prospects', id) : {status:'Mailed', project_ids: [], name:'Suivi', structure_id:S.newSuiviStructure||null, last_contact: today()};
   openModal({ title: id ? prospectTitle(p) : 'Nouveau suivi', values: {...p, project_ids: projIds(p)},
     fields: [
-      {k:'structure_id', label:'Structure — tape le nom, ou crée-la si elle n’existe pas', type:'ac', kind:'structures', create:true, full:true},
+      {k:'structure_id', label:'Structure — tape le nom, ou crée-la si elle n’existe pas', type:'ac', kind:'structures', create:true, activeOnly:true, full:true},
       {k:'project_ids', label:'Artiste(s) concerné(s)', type:'checks', options:activeProjects(projIds(p)), full:true},
       {k:'status', label:'Statut', type:'select', options:PROSPECT_OPTS, blank:false},
       {k:'last_contact', label:'Dernier contact', type:'date'},
@@ -378,7 +597,8 @@ export function editProspect(id){
         {k:'_kind', label:'Type d’échange', type:'select', options:['Appel','Mail','RDV','Note'], blank:false},
         {k:'_files', label:'Pièces jointes (PDF de mails…)', type:'files', full:true}]),
     ],
-    onDelete: id ? () => remove('prospects', id) : null,
+    deleteAsk: id ? () => prospectDeleteAsk(id) : null,
+    onDelete: id ? () => deleteProspect(id) : null,   // journal, pièces et fichiers stockés avec lui (v1.46b)
     onSave: async v => {
       if (!v.structure_id){ toast('Choisis ou crée la structure', true); return false; }
       const files = v._files || [], note = v._note, contact = v._contact, kind = v._kind || 'Appel';
@@ -512,10 +732,10 @@ async function cropSquare(path, [px, py, z]){
 
 /** Lier un dossier Drive existant à une date (lien collé) */
 export async function linkDrive(showId){
-  const v = prompt('Colle le lien du dossier Google Drive de cette date');
+  const v = await askText({title: 'Lier un dossier Drive', label: 'Lien du dossier Google Drive de cette date', placeholder: 'https://drive.google.com/drive/folders/…', ok: 'Lier le dossier',
+    check: x => /^[\w-]{10,}$/.test(driveId(x)) ? '' : 'Lien de dossier Drive non reconnu'});
   if (!v) return;
   const id = driveId(v);
-  if (!/^[\w-]{10,}$/.test(id)) return toast('Lien de dossier Drive non reconnu', true);
   await save('shows', showId, {drive_folder_id: id, drive_folder_error: null});
   toast('Dossier Drive lié');
 }
@@ -524,6 +744,9 @@ export { touch, render };
 
 /** Supprimer un artiste : ses modèles de mail partagés avec d'autres artistes restent (réattribués), seuls les siens partent */
 async function deleteProject(id){
+  // spectacles (v1.57) : la base refuse de supprimer un artiste qui en a ; on le dit AVANT de toucher aux modèles de mail (relecture V1.57)
+  const sp = spectaclesOf(id);
+  if (sp.length){ toast(`Cet artiste a ${sp.length} spectacle${sp.length > 1 ? 's' : ''} (${sp.map(x => x.name).join(', ')}) : il ne peut pas être supprimé. Passe-le en inactif.`, true); return false; }
   for (const t of (S.db.mail_templates || []).filter(t => (t.project_ids || []).includes(id) && t.project_ids.length > 1)){
     const ids = t.project_ids.filter(x => x !== id);
     await save('mail_templates', t.id, {project_ids: ids, project_id: ids[0]}, {rerender: false});

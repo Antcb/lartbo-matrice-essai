@@ -5,6 +5,7 @@
  * Les conditions affichées sont toujours celles de la base : si l'équipe corrige le cachet
  * ou les acomptes, la fiche est à jour sans renvoyer de lien.
  */
+import { eur, fmtDate, pct as fmtPct, MAIL_MSG, checkMails } from './utils.js';
 import { CFG } from './config.js';
 import { localDel, localGet, localSet } from './storage.js';
 import './ui/testbanner.js';
@@ -15,13 +16,14 @@ const sb = window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY,
 const root = document.getElementById('fiche');
 const token = new URLSearchParams(location.search).get('t') || '';
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const eur = n => n == null ? '—' : Number(n).toLocaleString('fr-FR', {style:'currency', currency:'EUR', maximumFractionDigits: Number(n) % 1 ? 2 : 0});
-const pct = n => n == null ? '' : String(n).replace('.', ',') + ' %';
+const pct = n => n == null ? '' : fmtPct(n);   // formats officiels (§2.2, §2.4) : « 33,33 % » au lieu de « 33,3333 % »
 const DRAFT = 'fiche-brouillon-' + token;
 
 async function load(){
   if (!token) return fail('Ce lien est incomplet. Vérifie le lien reçu par mail.');
   const {data, error} = await sb.rpc('fiche_get', {p_token: token});
+  // dossier fermé par l'équipe (date archivée, v1.60.3 — fiche_get) : message neutre, sans détail
+  if (error && /Dossier indisponible/.test(error.message || '')) return fail('Dossier indisponible. Pour toute question, écris-nous à production@lartboristerie.com.');
   if (error) return fail('La fiche ne peut pas être chargée pour le moment. Réessaie dans quelques minutes.');
   if (!data) return fail('Ce lien n’est pas valide. Vérifie le lien reçu par mail ou écris-nous à production@lartboristerie.com.');
   draw(data);
@@ -81,7 +83,7 @@ function draw(d){
   const values = {}; FICHE_SECTIONS.forEach(sec => sec.fields.forEach(f => values[f.k] = val(f)));
   const locked = !!d.locked;
   root.innerHTML = conditions(d) + `
-    ${d.submitted_at ? `<div class="panel pad fiche-ok">Fiche envoyée le ${new Date(d.submitted_at).toLocaleDateString('fr-FR')}${d.validated_at ? ' et validée par notre équipe' : ''}. ${locked ? 'Le contrat est en préparation : la fiche n’est plus modifiable.' : 'Tu peux encore la corriger et la renvoyer.'}</div>` : ''}
+    ${d.submitted_at ? `<div class="panel pad fiche-ok">Fiche envoyée le ${fmtDate(d.submitted_at)}${d.validated_at ? ' et validée par notre équipe' : ''}. ${locked ? 'Le contrat est en préparation : la fiche n’est plus modifiable.' : 'Tu peux encore la corriger et la renvoyer.'}</div>` : ''}
     <form id="fiche-form" class="fiche-form" novalidate>
       ${FICHE_SECTIONS.map(sec => `<section class="panel pad"><h2>${esc(sec.title)}</h2>${sec.help ? `<p class="help">${esc(sec.help)}</p>` : ''}
         <div class="fiche-grid${sec.cols === 3 ? ' cols3' : ''}">${sec.fields.map(f => input(f, values[f.k], locked, kind, values)).join('')}</div></section>`).join('')}
@@ -98,6 +100,8 @@ function draw(d){
     const missing = [...form.querySelectorAll('[required]')].filter(x => !x.closest('[hidden]') && !x.value.trim())
       .concat([...form.querySelectorAll('fieldset[data-req]')].filter(fs => !fs.closest('[hidden]') && !fs.querySelector('input:checked')));
     if (missing.length){ missing.forEach(x => x.classList.add('invalid')); (missing[0].querySelector?.('input') || missing[0]).focus(); return note(`Il manque ${missing.length} champ${missing.length > 1 ? 's' : ''} obligatoire${missing.length > 1 ? 's' : ''}.`, true); }
+    // mails au bon format, message sous chaque champ fautif (Q23, même contrôle que l'application)
+    const badMail = checkMails(form); if (badMail.length){ badMail[0].focus(); return note(MAIL_MSG + '.', true); }
     const v = read(form), adm = {}, fi = {};
     FICHE_SECTIONS.forEach(sec => sec.fields.forEach(f => { if (fieldOn(f, kind, v)) (f.src === 'admin' ? adm : fi)[f.k] = v[f.k] || ''; }));
     const btn = form.querySelector('button[type=submit]'); btn.disabled = true; btn.textContent = 'Envoi…';

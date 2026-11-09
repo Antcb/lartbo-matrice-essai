@@ -6,17 +6,20 @@
  *   partagé avec le coproducteur selon le % de la date.
  * Chaque montant existe en prévu et en réel (billets vendus, pièces reçues).
  */
-import { lineValue, lineForecast, linesOf } from './budget.js';
+import { eur2, r2 } from './utils.js';
+import { isCnmLine, isSacemLine, lineValue, lineForecast, linesOf } from './budget.js';
+import { cnmRate } from './corea.js';
 import { byId } from './selectors.js';
+import { payAmount, paymentsOf } from './calc.js';
 
-const r2 = n => Math.round((Number(n) || 0) * 100) / 100;
 const num = v => v == null || v === '' ? null : Number(v);
 
 export const isProductionShow = s => !!s && /^(Production|Co-Production)$/.test(s.contract_type || '') && s.prod_mode !== 'booking';
 export const PROD_CATS = ['Salle', 'Promoteur'];
 
 export const PROD_DEFAULTS = {
-  reps: 1, vat: 5.5, cnm_pct: 3.5, sacem_pct: 8.8, sacd_pct: 0, sacd_ms_pct: 0, agessa_pct: 1.1,
+  reps: 1, vat: 5.5, sacem_pct: 8.8,   // taux CNM : celui de la date ou des Réglages (cnmRate, v1.51), plus de 3,5 écrit ici
+  sacd_pct: 0, sacd_ms_pct: 0, agessa_pct: 1.1,
   promo_net_pct: 0, promo_dl_pct: 0, artbo_share: 100, invitations: 0,
   tickets: [{label: 'Prix unique', qty: 0, price: 0, dl_prod: 0, dl_net: 0}],
 };
@@ -27,6 +30,17 @@ export function prodOf(s){
   if (s?.production?.artbo_share == null) p.artbo_share = s?.contract_type === 'Co-Production' && s?.partner_id ? 50 : 100;
   return p;
 }
+
+/**
+ * Lignes de Factures d'une coproduction (décision d'Anthony du 28/10/2026) : qualifiées EXPLICITEMENT (show_payments.coprod_role) —
+ *   « recette » : recette complémentaire de coproduction, intégrée UNE fois au résultat, encaissée par L'ArtBo ou le coproducteur
+ *   (coprod_holder) ; « hors_resultat » : hors calcul du résultat ; « ailleurs » : déjà comptabilisée ailleurs (billetterie…), jamais
+ *   ajoutée. Aucune requalification automatique ; les lignes « hors calcul » historiques (v1.44) et les anciennes lignes « Taxe CNM »
+ *   ne sont pas concernées (taxes déjà dans les droits et taxes).
+ */
+export const COPROD_ROLES = [['recette', 'Recette complémentaire de coproduction'], ['hors_resultat', 'Hors calcul'], ['ailleurs', 'Déjà comptabilisée ailleurs']];
+export const coprodLines = s => s?.contract_type === 'Co-Production' ? paymentsOf(s.id).filter(p => p.kind !== 'cnm') : [];
+export const coprodReceipts = s => coprodLines(s).filter(p => p.coprod_role === 'recette');
 
 /** Calcul complet, en prévu (real=false) ou en réel (billets vendus, dépenses réelles) */
 export function productionBudget(s, real = false){
@@ -41,29 +55,54 @@ export function productionBudget(s, real = false){
   const dlTtc = r2(tickets.reduce((a, t) => a + t.dl, 0));
   const ht = r2(grossTtc / (1 + vat / 100)), dlHt = r2(dlTtc / (1 + vat / 100));
   const capacity = (Number(s.capacity) || 0) * (Number(p.reps) || 1);
-  // droits et taxes (sur la recette HT, comme le tableau)
-  const cnm = r2(Math.round(ht) * (num(p.cnm_pct) || 0) / 100);
+  // droits et taxes : sur la TOTALITÉ de la recette HT (comme le tableau) ; une dépense CNM / SACEM réelle saisie remplace le calcul
+  const lines = linesOf(s.id), taxLines = lines.filter(l => isCnmLine(l) || isSacemLine(l));
+  const realOf = test => { const ls = taxLines.filter(test).filter(l => l.amount != null); return real && ls.length ? r2(ls.reduce((a, l) => a + Number(l.amount), 0)) : null; };
+  const cnmCalc = r2(Math.round(ht) * cnmRate(s) / 100), cnmReal = realOf(isCnmLine);
+  const cnm = cnmReal ?? cnmCalc;
   const ag = (num(p.agessa_pct) || 0) / 100;
   const sacd = (() => { const d = Math.floor(ht * (num(p.sacd_pct) || 0)) / 100, cr = r2(ht * (num(p.sacd_pct) || 0) / 5 / 100); return r2(d + cr + r2(d * ag)); })();
   const sacdMs = (() => { const d = Math.floor(ht * (num(p.sacd_ms_pct) || 0)) / 100, cr = r2(ht * (num(p.sacd_ms_pct) || 0) / 5 / 100); return r2(d + cr + r2(d * ag)); })();
-  const sacem = (() => { const d = Math.floor(ht * (num(p.sacem_pct) || 0)) / 100; return r2(d + r2(d * ag)); })();
+  const sacemReal = realOf(l => isSacemLine(l) && !isCnmLine(l));
+  const sacem = sacemReal ?? (() => { const d = Math.floor(ht * (num(p.sacem_pct) || 0)) / 100; return r2(d + r2(d * ag)); })();
   const taxes = r2(cnm + sacd + sacdMs + sacem);
   const net = r2(ht - taxes);
-  // coûts : lignes du budget de la date (salle, promoteur…), prévu ou réel
-  const lines = linesOf(s.id);
+  // coûts : lignes du budget de la date (salle, promoteur…), prévu ou réel — hors CNM / SACEM, déjà dans les taxes (jamais deux fois)
+  const costLines = lines.filter(l => !taxLines.includes(l));
   const costOf = l => real ? (l.amount != null ? Number(l.amount) : 0) : (lineForecast(l) ?? (Number(l.amount) || 0));
   const byCat = {};
-  lines.forEach(l => { byCat[l.category || 'Autres'] = r2((byCat[l.category || 'Autres'] || 0) + costOf(l)); });
-  const costs = r2(lines.reduce((a, l) => a + costOf(l), 0));
+  costLines.forEach(l => { byCat[l.category || 'Autres'] = r2((byCat[l.category || 'Autres'] || 0) + costOf(l)); });
+  const costs = r2(costLines.reduce((a, l) => a + costOf(l), 0));
   const promo = r2(net * (num(p.promo_net_pct) || 0) / 100 + dlHt * (num(p.promo_dl_pct) || 0) / 100);
-  const result = r2(net - costs - promo);
-  const resultDl = r2(net + dlHt - costs - promo);
-  const share = (num(p.artbo_share) ?? 100) / 100;
+  // recettes complémentaires de coproduction : une seule fois, prévu comme réel (montant de la ligne)
+  const receipts = coprodReceipts(s), extra = r2(receipts.reduce((a, x) => a + (payAmount(x) || 0), 0));
+  const result = r2(net - costs - promo + extra);
+  const resultDl = r2(net + dlHt - costs - promo + extra);
+  const share = (num(p.artbo_share) ?? 100) / 100, sp = coprodSplit(s, p, resultDl, promo);
   return {p, tickets, paying, invitations, total: paying + invitations, capacity,
     fill: capacity ? (paying + invitations) / capacity : null, avgPrice: paying ? r2(grossTtc / paying) : 0,
-    grossTtc, dlTtc, ht, dlHt, vatAmount: r2(grossTtc - ht), cnm, sacem, sacd, sacdMs, taxes, net, netPerTicket: paying ? r2(net / paying) : 0,
-    costs, byCat, promo, result, resultDl, artbo: r2(resultDl * share), partner: r2(resultDl * (1 - share)), share,
+    grossTtc, dlTtc, ht, dlHt, vatAmount: r2(grossTtc - ht), cnm, cnmCalc, cnmReal, cnmRate: cnmRate(s), sacemReal, taxLines, sacem, sacd, sacdMs, taxes, net, netPerTicket: paying ? r2(net / paying) : 0,
+    costs, byCat, promo, extra, receipts, result, resultDl, shared: sp.shared, artbo: sp.artbo, partner: sp.partner, lossMissing: sp.lossMissing, share,
     partnerName: byId('partners', s.partner_id)?.name || 'Coproducteur'};
+}
+
+/**
+ * Partage du résultat entre L'ArtBo et le coproducteur (décisions d'Anthony du 27/10 et du 05/11/2026) :
+ *   - promotion locale à la charge d'une seule partie : hors du résultat partagé (rajoutée au résultat global), puis retirée de la
+ *     part de cette partie — jamais déduite deux fois ;
+ *   - bénéfice : % du contrat (artbo_share) ; PERTE : % des pertes du contrat (artbo_loss_share), saisi date par date, jamais déduit
+ *     du % des bénéfices ; absent alors qu'il est nécessaire (résultat partagé négatif) → parts non calculées, information manquante ;
+ *   - L'ArtBo seule productrice (100 %, aucun coproducteur) : elle porte tout, bénéfice comme perte.
+ */
+export function coprodSplit(s, p, result, promo){
+  const debtor = p.promo_debtor || null, own = promo && ['artbo', 'partenaire'].includes(debtor) ? promo : 0;
+  // L'ArtBo seule productrice : 100 % des bénéfices, hors coproduction avec un coproducteur (un partenaire de commission ne
+  // partage pas le résultat) — elle porte alors aussi 100 % des pertes
+  const shared = r2(result + own), gain = num(p.artbo_share) ?? 100, sole = gain >= 100 && !(s?.contract_type === 'Co-Production' && s?.partner_id);
+  const lossPct = sole ? 100 : num(p.artbo_loss_share), pctA = shared >= 0 ? gain : lossPct;
+  const lossMissing = shared < 0 && pctA == null;
+  const artbo = pctA == null ? null : r2(shared * pctA / 100 - (debtor === 'artbo' ? own : 0));
+  return {shared, own, debtor, lossPct, lossMissing, artbo, partner: artbo == null ? null : r2(result - artbo)};
 }
 
 /** Lignes de coûts proposées pour une nouvelle production (reprises du tableau Cabaret Sauvage, montants à saisir) */
@@ -76,3 +115,116 @@ export const PROD_LINES = [
   ['Promoteur', 'Repas soir'], ['Promoteur', 'Fournitures loges'], ['Promoteur', 'Repas prod'],
 ];
 export { lineValue };
+
+/**
+ * 🤝 Coproduction : positions de chacun et reversement (décisions d'Anthony du 27/10/2026). Sur les montants RÉELS :
+ *   - résultat global réel (DL inclus) réparti selon les % du contrat, bénéfice ou perte ;
+ *   - la structure qui encaisse les recettes garde la recette nette (HT, après droits et taxes, DL inclus) ;
+ *   - promotion locale : débiteur contractuel (charge commune, ou une partie seule : hors du résultat partagé, retirée de sa part)
+ *     et payeur réel saisis à part, jamais présumés (v1.51) ; payée par l'un, elle compte dans sa position ;
+ *   - toute dépense réelle (ou promo) pas encore payée bloque la clôture, comme des recettes de billetterie pas encore encaissées ;
+ *   - recettes complémentaires qualifiées (coprod_role) : dans le résultat une fois, dans la position de celle qui les encaisse ;
+ *     non encaissées, non qualifiées ou sans encaisseur : clôture bloquée ;
+ *   - avance (promo payée par l'un, due par l'autre) : comptée une fois dans la position du payeur, retirée de la part du débiteur ;
+ *   - chacun a payé ses dépenses réelles (payeur « L'ArtBo » ou « coproducteur », date de paiement remplie) ;
+ *   - reversement = part due − position réelle ; celui qui reçoit le reversement facture l'autre (facture préparée à la main).
+ * Rien n'est payé ni facturé automatiquement ; un reversement n'est payé que quand sa date de paiement est notée.
+ */
+/** Promotion locale d'une coproduction : à qui elle incombe selon le contrat (v1.51) */
+export const PROMO_DEBTORS = [['commun', 'Charge commune (déduite du résultat partagé)'], ['artbo', 'L’ArtBoristerie seule'], ['partenaire', 'Le coproducteur seul']];
+export const PROMO_PAYERS = [['artbo', 'L’ArtBoristerie'], ['partenaire', 'Le coproducteur']];
+/**
+ * Partie qui supporte la promotion locale sans choix explicite (décision d'Anthony du 07/11/2026) :
+ *   - dossier EXISTANT : calcul historique conservé (charge commune, le résultat partagé la contient), affiché « charge commune —
+ *     règle existante à confirmer » ; la clôture n'est pas bloquée à ce titre ;
+ *   - NOUVEAU dossier avec une promotion : le choix est demandé avant la clôture (bloquant).
+ * Critère vérifiable de « nouveau dossier » : date créée (shows.created_at, rempli par la base) à partir du 07/11/2026 0 h (heure de
+ * Paris), ou date de création inconnue (cas le plus sûr : le choix est demandé). Les résultats déjà clôturés gardent leur synthèse.
+ */
+export const PROMO_CHOICE_FROM = '2026-11-06T23:00:00Z';
+export const PROMO_LEGACY_LABEL = 'Charge commune — règle existante à confirmer';
+export const promoDebtorLegacy = s => !!s?.created_at && new Date(s.created_at).getTime() < Date.parse(PROMO_CHOICE_FROM);
+/** Débiteur de la promotion : choix explicite, sinon « commun » historique pour un dossier existant (assumed), sinon null */
+export function promoDebtorOf(s, p = prodOf(s)){
+  if (PROMO_DEBTORS.some(d => d[0] === p.promo_debtor)) return {debtor: p.promo_debtor, assumed: false};
+  return promoDebtorLegacy(s) ? {debtor: 'commun', assumed: true} : {debtor: null, assumed: false};
+}
+export function coprodClose(s){
+  const r = productionBudget(s, true), p = r.p, issues = [], warnings = [];
+  const holder = s.ticket_holder, share = num(p.artbo_share);
+  if (!['artbo', 'partenaire'].includes(holder)) issues.push('Indique qui encaisse les recettes : L’ArtBoristerie ou le coproducteur');
+  if (!p.tickets.length || p.tickets.some(t => t.real_qty == null || t.real_qty === '')) issues.push('Recettes réelles : saisis les billets vendus de chaque tarif');
+  if (share == null || share < 0 || share > 100) issues.push('Part de L’ArtBo : un pourcentage entre 0 et 100');
+  else if (share < 100 && !s.partner_id) issues.push('Choisis le coproducteur de la date (sa part est de ' + r2(100 - share) + ' %)');
+  const costLines = linesOf(s.id).filter(l => !r.taxLines.includes(l));
+  // taxes CNM / SACEM payées pour de vrai (lignes saisies) : comptées chez celui qui les a payées ; les taxes seulement
+  // calculées sont supposées payées par la structure qui encaisse (détentrice de la billetterie)
+  const taxPaidLines = r.taxLines.filter(l => l.amount != null && Number(l.amount) !== 0);
+  const onlyPlanned = costLines.filter(l => l.amount == null && (lineForecast(l) || 0) !== 0);
+  if (onlyPlanned.length) issues.push(`${onlyPlanned.length} dépense${onlyPlanned.length > 1 ? 's' : ''} seulement prévue${onlyPlanned.length > 1 ? 's' : ''} : saisis le montant réel (ou 0)`);
+  const realLines = [...costLines.filter(l => l.amount != null && Number(l.amount) !== 0), ...taxPaidLines];
+  const noPayer = realLines.filter(l => !['artbo', 'partenaire'].includes(l.payer));
+  if (noPayer.length) issues.push(`${noPayer.length} dépense${noPayer.length > 1 ? 's' : ''} réelle${noPayer.length > 1 ? 's' : ''} sans payeur L’ArtBo / coproducteur : précise qui l’a payée`);
+  // dépense restant à payer : bloque la clôture définitive (décision d'Anthony du 27/10/2026, au soir) ; le résultat prévisionnel reste visible
+  const unpaidLines = realLines.filter(l => !l.paid_at);
+  const unpaid = r2(unpaidLines.reduce((a, l) => a + Number(l.amount), 0));
+  if (unpaidLines.length) issues.push(`${unpaidLines.length} dépense${unpaidLines.length > 1 ? 's' : ''} réelle${unpaidLines.length > 1 ? 's' : ''} pas encore payée${unpaidLines.length > 1 ? 's' : ''} (${eur2(unpaid)}) : note la date de paiement avant la clôture`);
+  // promotion locale (même décision) : jamais présumée supportée ni payée par la structure qui encaisse. Débiteur contractuel
+  // (charge commune du résultat, ou L'ArtBo / le coproducteur seul) et payeur réel (avec sa date de paiement) saisis à part.
+  const promo = r.promo, debtor = p.promo_debtor || null, payer = p.promo_payer || null, promoPaid = !!p.promo_paid_at;
+  // recettes attendues et intégrées au résultat (billetterie et DL, réelles) : encaissées avant la clôture définitive (27/10, 22 h 35)
+  if (r.ht + r.dlHt > 0 && !p.receipts_cashed_at) issues.push(`Recettes de billetterie (${eur2(r2(r.ht + r.dlHt))} HT) pas encore notées encaissées : note la date d’encaissement par ${holder === 'partenaire' ? 'le coproducteur' : holder === 'artbo' ? 'L’ArtBoristerie' : 'la structure qui encaisse'}`);
+  if (promo < 0) issues.push('Promotion locale négative : vérifie ses pourcentages');
+  if (promo){
+    if (!PROMO_DEBTORS.some(d => d[0] === debtor) && !promoDebtorLegacy(s)) issues.push('Promotion locale : indique à qui elle incombe selon le contrat (charge commune, L’ArtBo seule ou le coproducteur seul) — choix obligatoire avant la clôture pour une date créée depuis le 07/11/2026');
+    if (!['artbo', 'partenaire'].includes(payer)) issues.push('Promotion locale : indique qui l’a réellement payée (L’ArtBo ou le coproducteur)');
+    if (!promoPaid) issues.push(`Promotion locale (${eur2(promo)}) pas encore payée : note sa date de paiement avant la clôture`);
+  }
+  // recettes complémentaires : chaque ligne qualifiée ; encaisseur connu ; encaissée avant la clôture définitive
+  const unqualified = coprodLines(s).filter(x => !COPROD_ROLES.some(c => c[0] === x.coprod_role));
+  if (unqualified.length) issues.push(`${unqualified.length} ligne${unqualified.length > 1 ? 's' : ''} de Factures à qualifier (recette complémentaire, hors calcul ou déjà comptabilisée ailleurs)`);
+  const rec = r.receipts;
+  if (rec.some(x => !['artbo', 'partenaire'].includes(x.coprod_holder))) issues.push('Recette complémentaire : indique qui doit l’encaisser (L’ArtBo ou le coproducteur)');
+  if (rec.some(x => !(payAmount(x) > 0))) issues.push('Recette complémentaire sans montant HT');
+  const recTodo = rec.filter(x => !x.paid_at);
+  if (recTodo.length) issues.push(`${recTodo.length} recette${recTodo.length > 1 ? 's' : ''} complémentaire${recTodo.length > 1 ? 's' : ''} attendue${recTodo.length > 1 ? 's' : ''} pas encore encaissée${recTodo.length > 1 ? 's' : ''} (${eur2(r2(recTodo.reduce((a, x) => a + (payAmount(x) || 0), 0)))}) : note la date d’encaissement`);
+  const cashedBy = who => r2(rec.filter(x => x.coprod_holder === who && x.paid_at).reduce((a, x) => a + (payAmount(x) || 0), 0));
+  const paidBy = who => r2(realLines.filter(l => l.payer === who && l.paid_at).reduce((a, l) => a + Number(l.amount), 0)
+    + (promo && payer === who && promoPaid ? promo : 0));
+  const realTaxes = r2((r.cnmReal ?? 0) + (r.sacemReal ?? 0));
+  const net = r2(r.ht + r.dlHt - (r.taxes - realTaxes));   // ce que garde la structure qui encaisse (taxes calculées payées par elle ; promo à part)
+  // résultat global (promo déduite, quel que soit son débiteur) ; promo à la charge d'une seule partie : hors du résultat partagé,
+  // retirée de la part de cette partie
+  const result = r.resultDl, sp = coprodSplit(s, p, result, promo), shared = sp.shared;
+  const lossIn = num(p.artbo_loss_share);
+  if (lossIn != null && (lossIn < 0 || lossIn > 100)) issues.push('Part des pertes de L’ArtBo : un pourcentage entre 0 et 100');
+  if (sp.lossMissing) issues.push('Résultat partagé négatif : indique la part des pertes supportée par L’ArtBo selon le contrat (elle ne se déduit pas du partage des bénéfices)');
+  const artboPart = sp.artbo, partnerPart = sp.partner;
+  const posArtbo = r2((holder === 'artbo' ? net : 0) + cashedBy('artbo') - paidBy('artbo')), posPartner = r2((holder === 'partenaire' ? net : 0) + cashedBy('partenaire') - paidBy('partenaire'));
+  const transfer = artboPart == null ? 0 : r2(artboPart - posArtbo);   // > 0 : le coproducteur reverse à L'ArtBo ; < 0 : L'ArtBo reverse au coproducteur
+  // reversement PROVISOIRE (demande d'Anthony du 07/11/2026) : tant qu'un paiement ou un encaissement nécessaire au calcul des
+  // positions n'est pas renseigné, le montant affiché n'est qu'une estimation (rien n'est présumé payé ni encaissé) ; information
+  // seulement, aucune règle de calcul ni de clôture n'est modifiée (les mêmes points bloquent déjà la clôture)
+  const pending = [];
+  if (!['artbo', 'partenaire'].includes(holder)) pending.push('structure qui encaisse les recettes');
+  if (!p.tickets.length || p.tickets.some(t => t.real_qty == null || t.real_qty === '')) pending.push('billets vendus');
+  else if (r.ht + r.dlHt > 0 && !p.receipts_cashed_at) pending.push('date d’encaissement de la billetterie');
+  if (onlyPlanned.length) pending.push('montant réel de dépenses seulement prévues');
+  if (noPayer.length) pending.push('payeur de dépenses réelles');
+  if (unpaidLines.length) pending.push('date de paiement de dépenses réelles');
+  if (promo && !PROMO_DEBTORS.some(d => d[0] === debtor) && !promoDebtorLegacy(s)) pending.push('partie qui supporte la promotion locale');
+  if (promo && !['artbo', 'partenaire'].includes(payer)) pending.push('payeur de la promotion locale');
+  if (promo && !promoPaid) pending.push('date de paiement de la promotion locale');
+  if (unqualified.length) pending.push('qualification de lignes de Factures');
+  if (rec.some(x => !['artbo', 'partenaire'].includes(x.coprod_holder))) pending.push('encaisseur de recettes complémentaires');
+  if (recTodo.length) pending.push('date d’encaissement de recettes complémentaires');
+  return {r, issues, warnings, ok: !issues.length, pending, provisional: !!pending.length, snapshot: {
+    holder, recettes_ht: r.ht, dl_ht: r.dlHt, taxes: r.taxes, cnm: r.cnm, sacem: r.sacem, costs: r.costs, promo: r.promo, result, shared_result: shared,
+    promo_debtor: debtor, ...(promo && !PROMO_DEBTORS.some(d => d[0] === debtor) && promoDebtorLegacy(s) ? {promo_debtor_rule: 'commun_historique'} : {}), promo_payer: payer, promo_paid_at: p.promo_paid_at || null, receipts_cashed_at: p.receipts_cashed_at || null,
+    extra_receipts: r.extra, cashed_artbo: cashedBy('artbo'), cashed_partner: cashedBy('partenaire'),
+    promo_advance: promo && payer && debtor && debtor !== 'commun' && payer !== debtor ? promo : 0,   // avance faite pour le compte de l'autre
+    artbo_share: share, artbo_loss_share: sp.lossPct, artbo_part: artboPart, partner_part: partnerPart, partner: r.partnerName,
+    net_encaisse: net, paid_artbo: paidBy('artbo'), paid_partner: paidBy('partenaire'), unpaid, pos_artbo: posArtbo, pos_partner: posPartner,
+    transfer: Math.abs(transfer), from: transfer > 0 ? 'partenaire' : transfer < 0 ? 'artbo' : null, to: transfer > 0 ? 'artbo' : transfer < 0 ? 'partenaire' : null,
+  }};
+}

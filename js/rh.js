@@ -5,6 +5,7 @@
  * Les numéros sensibles déjà connus ne sont jamais réaffichés (seulement « déjà renseigné »).
  */
 import { CFG } from './config.js';
+import { MAIL_MSG, checkMails, esc, fmtDate, today } from './utils.js';
 import './ui/testbanner.js';
 import './ui/dropfiles.js';
 import './ui/filepick.js';
@@ -14,7 +15,6 @@ import { RH_DOCS, RH_PARTS, RH_SECTIONS, partOf } from './rh-fields.js';
 const sb = window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY, {auth:{persistSession:false}});
 const root = document.getElementById('fiche');
 const token = new URLSearchParams(location.search).get('t') || '';
-const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const FILLED = '__rempli__';
 const PART = new URLSearchParams(location.search).get('p') === 'main' ? 'main' : 'extra';   // le lien envoyé = infos complémentaires
 const SECTIONS = RH_SECTIONS.filter(s => partOf(s) === PART), DOCS = RH_DOCS.filter(d => d[3] === PART);
@@ -47,7 +47,7 @@ function draw(d){
   root.innerHTML = `
     <section class="panel pad"><p class="fiche-kicker">${esc(RH_PARTS[PART])}</p><h1>${esc([d.first_name, d.last_name].filter(Boolean).join(' ') || 'Bienvenue')}</h1>
       <p class="help">${PART === 'extra' ? 'Quelques informations en plus de ta fiche Movinmotion, utiles pour les déplacements en tournée. Elles restent confidentielles.' : 'Ces informations servent à établir tes contrats et bulletins de paie avec L’ArtBoristerie Productions. Elles restent confidentielles.'}</p>
-      ${d.submitted_at ? `<p class="fiche-engage">Fiche déjà envoyée le ${new Date(d.submitted_at).toLocaleDateString('fr-FR')}. Tu peux la compléter ou la corriger.</p>` : ''}</section>
+      ${d.submitted_at ? `<p class="fiche-engage">Fiche déjà envoyée le ${fmtDate(d.submitted_at)}. Tu peux la compléter ou la corriger.</p>` : ''}</section>
     <form id="rh-form" class="fiche-form" novalidate>
       ${SECTIONS.map(sec => `<section class="panel pad"><h2>${esc(sec.title)}</h2>${sec.help ? `<p class="help">${esc(sec.help)}</p>` : ''}
         <div class="fiche-grid">${sec.fields.map(f => input(f, values[f.k], values)).join('')}</div></section>`).join('')}
@@ -58,7 +58,7 @@ function draw(d){
     </form>`;
   const form = document.getElementById('rh-form');
   // dates cohérentes : naissance / délivrance / obtention pas dans le futur ; expiration jamais avant la délivrance
-  const todayISO = new Date().toLocaleDateString('sv-SE');
+  const todayISO = today();
   form.querySelectorAll('input[type=date]').forEach(i => { if (/^birth_date$|_issued$|_date$/.test(i.name) && !/_expires$/.test(i.name)) i.max = todayISO; });
   const pairExp = () => form.querySelectorAll('input[type=date][name$="_expires"]').forEach(x => {
     const iss = form.querySelector(`input[name="${x.name.replace(/_expires$/, '_issued')}"]`);
@@ -76,6 +76,8 @@ function draw(d){
       .concat([...form.querySelectorAll('fieldset[data-req]')].filter(fs => shown(fs) && !fs.querySelector('input:checked')))
       .concat([...form.querySelectorAll('[data-req-doc]')].filter(x => shown(x) && !x.files.length));
     if (missing.length){ missing.forEach(x => x.classList.add('invalid')); (missing[0].querySelector?.('input') || missing[0]).focus(); return note(`Il manque ${missing.length} élément${missing.length > 1 ? 's' : ''} obligatoire${missing.length > 1 ? 's' : ''}.`, true); }
+    // mails au bon format, message sous chaque champ fautif (Q23, même contrôle que l'application)
+    const badMail = checkMails(form); if (badMail.length){ badMail[0].focus(); return note(MAIL_MSG + '.', true); }
     const badDate = [...form.querySelectorAll('input[type=date]')].find(x => shown(x) && x.value && ((x.min && x.value < x.min) || (x.max && x.value > x.max)));
     if (badDate){ badDate.classList.add('invalid'); badDate.focus(); return note(badDate.min && badDate.value < badDate.min ? 'La date d’expiration ne peut pas être avant la date de délivrance.' : 'Cette date ne peut pas être dans le futur.', true); }
     const v = Object.fromEntries([...new FormData(form)].filter(([, x]) => typeof x === 'string').map(([k, x]) => [k, x.trim()]));

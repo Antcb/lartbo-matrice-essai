@@ -5,17 +5,21 @@
  * tâche Booking de relance à J+10.
  * « Relance » : réponse dans le même fil Gmail (l'historique reste), journal, nouvelle tâche de relance.
  */
+import { calCheckBeforeSave } from './calendars.js';
+import { confirmAsk } from './ui/dialog.js';
 import { render } from './app.js';
-import { insert, save, sb, signedUrl } from './data.js';
+import { contentTypeOf, insert, purgeStored, remove, save, sb, signedUrl, typedFile } from './data.js';
 import { showPrefillFromStructure } from './forms.js';
-import { PROSPECT_TAGS, callScript, fill, tplLabel, tplProjects } from './mail.js';
-import { suiviClosed, byId, byUsage, contactMails, eventsOfStructure, linksOfStructure, logsOf, projIds, projName, prospectsOfStructure, setting, structName } from './selectors.js';
-import { S } from './state.js';
+import { PROSPECT_TAGS, attOk, attSizeHTML, callGoogle, callScript, fill, todoOk, tplLabel, tplProjects } from './mail.js';
+import { suiviClosed, byId, byUsage, contactMails, eventsOfStructure, filesOf, linksOfStructure, logsOf, placeOfEvent, projIds, projName, prospectTitle, prospectsOfStructure, setting, structName } from './selectors.js';
+import { S, touch } from './state.js';
+import { geocode } from './geo.js';
 import { CONFIRMED_PROD } from './constants.js';
+import { recipientsField, syncChips } from './ui/recipients.js';
 import { dateInput } from './ui/datefield.js';
 import { openModal } from './ui/modal.js';
 import { rtStyle, rtToolbar, wrapMail } from './ui/richtext.js';
-import { esc, firstName, fmtDate, toast, today, workDay } from './utils.js';
+import { esc, firstName, fmtDate, toast, today, workDay, dayOf, addDays } from './utils.js';
 
 const RELANCE_DAYS = 10;
 const MAIL_RELANCES = 3;   // après 3 relances par mail sans réponse : relance par téléphone
@@ -35,9 +39,7 @@ const defaultSender = () => S.user?.email === PROD_MAIL ? 'production' : 'anthon
 export async function callProspect(action, payload, account='anthony'){
   if (account === 'production') return callScript('prospect_' + action, payload);
   if (!scriptUrl()) throw new Error('Le script de prospection n’est pas encore installé : Réglages › Prospection.');
-  const res = await fetch(scriptUrl(), {method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'},
-    body: JSON.stringify({secret: setting('drive_webhook_secret'), action, ...payload})});
-  const out = await res.json().catch(() => ({ok:false, error:'Réponse illisible du script de prospection'}));
+  const out = await callGoogle('prospect', action, payload);   // relais serveur : le code secret ne passe plus par le navigateur (v1.47)
   if (!out.ok) throw new Error(out.error || 'Erreur du script de prospection');
   return out;
 }
@@ -48,8 +50,7 @@ function concertVars(show){
   if (!show) return {};
   const proj = byId('projects', show.project_id), links = (proj?.links || []).filter(l => l?.url);
   const pro = links.find(l => /pro/i.test(l.label || '')) || links[0];
-  const d = new Date(show.date + 'T12:00:00'); d.setDate(d.getDate() - 2);
-  const iso = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  const iso = addDays(show.date, -2);   // fonction officielle (§1.6)
   const [y, m, j] = show.date.split('-');
   return {artiste: proj ? projName(proj.id) : undefined, date_concert: longDate(show.date), date_concert_court: `${j}/${m}/${y.slice(2)}`, ville_concert: show.city || structById(show.structure_id)?.city || '', cp_concert: show.department || '',
     lieu_concert: String(show.venue || '').replace(/\*\*/g, '').trim(), date_reponse: longDate(iso), lien_projet: pro?.url || '',
@@ -57,7 +58,7 @@ function concertVars(show){
 }
 const structById = id => id ? byId('structures', id) : null;
 /** Dates confirmées à venir des artistes choisis (pour inviter un programmateur) */
-const concertsOf = pids => S.db.shows.filter(s => pids.includes(s.project_id) && CONFIRMED_PROD.includes(s.status) && s.date >= today())
+const concertsOf = pids => S.db.shows.filter(s => !s.archived_at && pids.includes(s.project_id) && CONFIRMED_PROD.includes(s.status) && s.date >= today())
   .sort((a, b) => a.date.localeCompare(b.date));
 const CONCERT_TAGS = /\{\{(date_concert|date_concert_court|ville_concert|cp_concert|lieu_concert|date_reponse|lien_projet|lien_evenement)\}\}/;
 
@@ -81,6 +82,8 @@ export async function openProspection(structureId, {prospectId=null}={}){
   const p = prospectId ? byId('prospects', prospectId) : null;
   const relance = !!p;
   const st = byId('structures', structureId || p?.structure_id); if (!st) return;
+  // structure inactive (v1.54) : plus proposée par défaut ; on demande avant d'écrire
+  if (st.inactive_at && !(await confirmAsk('Structure inactive', `« ${st.name} » est marquée inactive (fermée). Préparer quand même ce mail ?`, 'Continuer'))) return;
   if (relance && !p.mail_thread_id) return toast('Ce suivi n’a pas de mail de prospection envoyé depuis la Matrice', true);
   if (relance && !p.mail_sent_at){
     await checkProspect(p, true);
@@ -89,7 +92,10 @@ export async function openProspection(structureId, {prospectId=null}={}){
   const kind = relance ? 'relance' : 'prospection';
   const contacts = linksOfStructure(st.id);
   const active = S.db.projects.filter(x => x.active).sort(byUsage);
-  let pids = relance ? projIds(p) : (S.project && byId('projects', S.project)?.active ? [S.project] : []);
+  // artiste(s) du mail : choisis explicitement dans la fenêtre — jamais repris du filtre d'affichage (v1.53, décision d'Anthony :
+  // un artiste choisi dans Production ne doit pas partir implicitement dans une prospection) ; une relance garde ceux du suivi
+  let pids = relance ? projIds(p) : [];
+  const filterName = !relance && S.project ? byId('projects', S.project)?.name : null;
   let contact = relance ? contacts.find(c => p.mail_to && [c.email, c.email_2].some(e => e && p.mail_to.toLowerCase().includes(e.toLowerCase()))) : contacts.find(c => contactMails(c));
   // tous les modèles du type : ceux des artistes cochés d'abord, puis les génériques, puis les autres (choisir un modèle coche ses artistes)
   const rank = t => { const ids = tplProjects(t); return ids.some(id => pids.includes(id)) ? 0 : !ids.length ? 1 : 2; };
@@ -99,15 +105,17 @@ export async function openProspection(structureId, {prospectId=null}={}){
   const fromAddr = () => sender === 'production' ? PROD_MAIL : (setting('prospect_from') || 'anthony@lartboristerie.com');
 
   const extra = `<div class="mail-wrap">
-    ${relance ? `<p class="mode-note">Réponse dans le fil « ${esc(p.mail_subject || '')} » envoyé à ${esc(p.mail_to || '')}${p.mail_sent_at ? ` le ${fmtDate(p.mail_sent_at.slice(0, 10))}` : ''} : l’historique reste en dessous du mail.</p>` : ''}
+    ${relance ? `<p class="mode-note">Réponse dans le fil « ${esc(p.mail_subject || '')} » envoyé à ${esc(p.mail_to || '')}${p.mail_sent_at ? ` le ${fmtDate(p.mail_sent_at)}` : ''} : l’historique reste en dessous du mail.</p>` : ''}
+    ${relance ? '' : `<p class="mode-note" id="pr-art-note">Coche le ou les artistes concernés par ce mail${filterName ? ` (le filtre d’affichage « ${esc(filterName)} » n’est pas repris d’office)` : ''}.</p>`}
     <div class="mail-grid">
       <label>Artiste(s)</label><div class="checks pills pr-arts">${active.map(a => `<label><input type="checkbox" data-pr-art="${a.id}" ${pids.includes(a.id) ? 'checked' : ''}> ${esc(a.name)}</label>`).join('')}</div>
       <label for="pr-from">Envoyé par</label><select id="pr-from" ${relance ? 'disabled title="La relance part de la boîte qui a envoyé la prospection"' : ''}>${Object.entries(SENDERS).map(([k, l]) => `<option value="${k}" ${k === sender ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
       <label for="pr-tpl">Modèle</label><select id="pr-tpl"></select>
       <label for="pr-show" class="pr-concert" hidden>Concert</label><span class="pr-concert" hidden><select id="pr-show"></select><small class="muted">remplit la date, la ville, le lieu, la date limite de réponse et les liens</small></span>
-      <label for="pr-contact">Destinataire</label><span class="mail-to"><select id="pr-contact"><option value="">— autre adresse —</option>${contacts.map(c => `<option value="${c.id}" ${c.id === contact?.id ? 'selected' : ''}>${esc(c.display_name)}${contactMails(c) ? ` · ${esc(contactMails(c))}` : ' (pas de mail)'}</option>`).join('')}</select>
-        <input id="pr-to" type="email" multiple placeholder="adresse@exemple.fr (plusieurs : séparées par des virgules)" value="${esc(relance ? (p.mail_to || '') : contactMails(contact))}"></span>
-      <label for="pr-cc">Copie</label><input id="pr-cc">
+      <label for="pr-contact" class="rcpt-who">Interlocuteur</label><span class="mail-to rcpt-who"><select id="pr-contact"><option value="">— autre adresse —</option>${contacts.map(c => `<option value="${c.id}" ${c.id === contact?.id ? 'selected' : ''}>${esc(c.display_name)}${contactMails(c) ? ` · ${esc(contactMails(c))}` : ' (pas de mail)'}</option>`).join('')}</select>
+        <small class="muted">personne à qui l’on s’adresse (prénom et balises du mail) ; la choisir remplace le destinataire</small><span class="rcpt-propose"></span></span>
+      <label for="pr-to-q">Destinataire</label>${recipientsField('pr-to', st.id, {value: relance ? (p.mail_to || '') : contactMails(contact), prospection: true, label: 'Destinataires', interlocutor: 'pr-contact'})}
+      <label for="pr-cc-q">Copie</label>${recipientsField('pr-cc', st.id, {prospection: true, label: 'Copies'})}
       ${relance ? '' : `<label for="pr-subj">Objet</label><input id="pr-subj">
       <label>Date proposée</label><span class="pr-date">${dateInput('', 'id="pr-date"')}<small class="muted">facultatif : crée la date en « Intérêt » pour chaque artiste</small></span>`}
     </div>
@@ -127,7 +135,13 @@ export async function openProspection(structureId, {prospectId=null}={}){
       if (!m.to) { toast('Indique le destinataire', true); return false; }
       if (!pids.length) { toast('Coche au moins un artiste', true); return false; }
       if (!relance && !m.subject) { toast('Indique l’objet du mail', true); return false; }
-      if (send && !confirm(`Envoyer le mail à ${m.to} maintenant ?`)) return false;
+      // délivrabilité (v1.52) : zones « à compléter » restées, pièces jointes lourdes
+      if (!(await todoOk(m))) return false;
+      if (!(await attOk(files))) return false;
+      // date proposée → dates « Intérêt » : agenda Google de chaque artiste vérifié avant l'envoi (même règle que la fenêtre de date)
+      const day = !relance && $('#pr-date')?.value;
+      if (day) for (const pid of pids) if (!(await calCheckBeforeSave({project_id: pid, date: day, status: 'Intérêt Salle'}))) return false;
+      if (send && !(await confirmAsk('Envoyer le mail ?', `Le mail part maintenant à ${m.to}${m.cc ? ` (copie : ${m.cc})` : ''}, depuis ${fromAddr()}.`, 'Envoyer le mail'))) return false;
       try {
         const attachments = await Promise.all(files.filter(f => f.on).map(async f => f.id ? {id: f.id} : {url: await signedUrl(f.path), name: f.name}));
         const out = relance
@@ -141,7 +155,7 @@ export async function openProspection(structureId, {prospectId=null}={}){
     }});
   const $ = sel => document.querySelector('#modal ' + sel);
   const current = () => ({to: $('#pr-to').value.trim(), cc: $('#pr-cc').value.trim(), subject: $('#pr-subj')?.value.trim() || '', html: wrapMail($('#pr-body').innerHTML), date: $('#pr-date')?.value || null});
-  const drawFiles = () => { $('#pr-files').innerHTML = files.map((f, i) => `<label class="att-chip"><input type="checkbox" data-att="${i}" ${f.on ? 'checked' : ''}> ${f.path ? '📎' : '🔗'} ${esc(f.name || 'Fichier Drive')}</label>`).join('') || '<span class="muted">aucune</span>'; };
+  const drawFiles = () => { $('#pr-files').innerHTML = files.length ? attSizeHTML(files) + ' ' + files.map((f, i) => `<label class="att-chip"><input type="checkbox" data-att="${i}" ${f.on ? 'checked' : ''}> ${f.path ? '📎' : '🔗'} ${esc(f.name || 'Fichier Drive')}</label>`).join('') : '<span class="muted">aucune</span>'; };
   const drawTpls = () => {
     const list = tplsFor(), cur = $('#pr-tpl').value;
     const grp = {0: 'Artistes cochés', 1: 'Tous les artistes', 2: 'Autres artistes'};
@@ -165,19 +179,26 @@ export async function openProspection(structureId, {prospectId=null}={}){
     const vars = prospectVars(st, {pids, contact, date: $('#pr-date')?.value || null, show: $('#modal .pr-concert')?.hidden ? null : byId('shows', $('#pr-show').value)});   // concert : seulement pour un modèle d'invitation
     if ($('#pr-subj') && (force || !dirty)) $('#pr-subj').value = t ? fill(t.subject, vars, false) : '';
     if (force || !dirty) $('#pr-body').innerHTML = (t ? fill(t.html, vars, true) : '') + signatureOf(sender);
-    if (force){ dirty = false; files = [...(t?.attachments || []).map(a => ({...a, on: true})), ...files.filter(f => f.mine)]; drawFiles(); if (t?.cc) $('#pr-cc').value = t.cc; }
+    // délivrabilité (v1.52) : au premier mail de prospection, les pièces jointes du modèle ne sont pas cochées d'office
+    if (force){ dirty = false; const was = new Map(files.map(f => [f.path || f.id, f.on]));   // cases déjà cochées gardées (changement d'expéditeur…)
+      files = [...(t?.attachments || []).map(a => ({...a, on: was.get(a.path || a.id) ?? !!relance})), ...files.filter(f => f.mine)]; drawFiles(); if (t?.cc) $('#pr-cc').value = t.cc; }
   };
-  drawTpls(); if (!pids.length) syncArtists(); $('#pr-tpl').dataset.prev = $('#pr-tpl').value; draw(true);
+  drawTpls(); $('#pr-tpl').dataset.prev = $('#pr-tpl').value; draw(true);   // aucun artiste coché d'office (v1.53)
+  syncChips(document.querySelector('#modal'));
   // modèle choisi → ses artistes sont cochés (un modèle « tous les artistes » garde la sélection)
   function syncArtists(){
     const ids = tplProjects(byId('mail_templates', $('#pr-tpl').value)); if (!ids.length || relance) return;
     pids = ids.filter(id => active.some(a => a.id === id));
     document.querySelectorAll('#modal [data-pr-art]').forEach(c => { c.checked = pids.includes(c.dataset.prArt); });
   }
-  $('#pr-tpl').onchange = () => { const prev = $('#pr-tpl').dataset.prev;
-    if (dirty && !confirm('Remplacer le texte retouché par ce modèle ?')){ $('#pr-tpl').value = prev; return; }
+  $('#pr-tpl').onchange = async () => { const prev = $('#pr-tpl').dataset.prev, next = $('#pr-tpl').value;
+    if (dirty){ $('#pr-tpl').value = prev;   // en attendant la réponse : le modèle d'avant reste affiché
+      if (!(await confirmAsk('Remplacer le texte retouché ?', 'Le texte du mail que tu as retouché sera remplacé par ce modèle.', 'Remplacer le texte', {danger: true}))) return;
+      $('#pr-tpl').value = next; }
     syncArtists(); const cur = $('#pr-tpl').value; drawTpls(); $('#pr-tpl').value = cur; $('#pr-tpl').dataset.prev = cur; draw(true); };
   $('#pr-body').addEventListener('input', () => { dirty = true; });
+  // objet retouché à la main (v1.56) : comme le texte, jamais réécrit en silence (artiste coché, date, contact…)
+  $('#pr-subj')?.addEventListener('input', () => { dirty = true; });
   document.querySelector('#modal .pr-arts').addEventListener('change', e => {
     const id = e.target.dataset.prArt; if (!id) return;
     pids = e.target.checked ? [...pids, id] : pids.filter(x => x !== id);
@@ -187,19 +208,21 @@ export async function openProspection(structureId, {prospectId=null}={}){
     $('#pr-tpl').dataset.prev = $('#pr-tpl').value;
     if ($('#pr-tpl').value !== before && !dirty) draw(true); else draw();
   });
-  $('#pr-contact').onchange = e => { contact = byId('contacts', e.target.value) || null; if (contactMails(contact)) $('#pr-to').value = contactMails(contact); draw(); };
+  $('#pr-contact').onchange = e => { contact = byId('contacts', e.target.value) || null; if (contactMails(contact)) $('#pr-to').value = contactMails(contact); draw(); syncChips(document.querySelector('#modal')); };
+  // interlocuteur proposé depuis une adresse choisie (v1.60.3) : sur clic seulement, sans toucher aux destinataires
+  $('#pr-contact').addEventListener('interlocutor', () => { contact = byId('contacts', $('#pr-contact').value) || null; draw(); syncChips(document.querySelector('#modal')); });
   $('#pr-date')?.addEventListener('change', () => draw());
-  $('#pr-show').onchange = () => { if (dirty && !confirm('Remplacer le texte retouché ?')) return; draw(true); };
+  $('#pr-show').onchange = async () => { if (dirty && !(await confirmAsk('Remplacer le texte retouché ?', 'Le texte du mail que tu as retouché sera réécrit avec ce concert.', 'Remplacer le texte', {danger: true}))) return; draw(true); };
   $('#pr-from').onchange = e => { const before = signatureOf(sender); sender = e.target.value; $('#pr-from-addr').textContent = fromAddr();
     // la signature suit l'expéditeur, sans toucher au texte déjà retouché
     const body = $('#pr-body'); if (before && body.innerHTML.endsWith(before)) body.innerHTML = body.innerHTML.slice(0, -before.length) + signatureOf(sender); else if (!dirty) draw(true); };
-  $('#pr-files').addEventListener('change', e => { const i = e.target.dataset.att; if (i != null) files[i].on = e.target.checked; });
+  $('#pr-files').addEventListener('change', e => { const i = e.target.dataset.att; if (i != null){ files[i].on = e.target.checked; drawFiles(); } });
   $('#pr-up').addEventListener('change', async e => {
     for (const f of e.target.files){
       const path = `mails/prospection/${st.id}/${Date.now()}_${f.name.replace(/[^\w.\-]+/g, '_')}`;
-      const {error} = await sb.storage.from('suivi').upload(path, f, {contentType: f.type || 'application/octet-stream'});
+      const {error} = await sb.storage.from('suivi').upload(path, typedFile(f), {contentType: contentTypeOf(f)});
       if (error){ toast('Envoi impossible : ' + error.message, true); continue; }
-      files.push({path, name: f.name, on: true, mine: true});
+      files.push({path, name: f.name, size: f.size, on: true, mine: true});
     }
     e.target.value = ''; drawFiles();
   });
@@ -227,7 +250,8 @@ async function recordProspection(st, {to, subject, html, send, out, pids, contac
   if (date){
     const status = isFestival(st) ? 'Intérêt Festival' : 'Intérêt Salle';
     const ev = eventsOfStructure(st.id).find(e => e.date_start && date >= e.date_start && date <= (e.date_end || e.date_start));
-    for (const pid of pids) await insert('shows', {...showPrefillFromStructure(st), venue: ev?.name || st.name, project_id: pid, date, status,
+    // lieu réel (v1.60.2) : celui de l'événement s'il y en a un à cette date (sa ville, pas celle du siège), sinon celui de la structure
+    for (const pid of pids) await insert('shows', {...showPrefillFromStructure(st), ...(ev ? placeOfEvent(ev) : {}), venue: ev?.name || st.name, project_id: pid, date, status,
       prospect_id: p.id, contract_type: 'Cession', communication_enabled: true, request_date: now});
   }
   await relanceTask(st, pids, subject, send, byId('prospects', p.id), 0);
@@ -237,7 +261,7 @@ async function recordProspection(st, {to, subject, html, send, out, pids, contac
 /** Dates de la prospection et des relances d'un suivi (journal) */
 export function relanceHistory(p){
   const logs = logsOf(p.id).filter(l => l.date && /^\*\*Relance n°\d+/.test(l.body || '')).map(l => l.date).sort();
-  return {sent: p.mail_sent_at ? p.mail_sent_at.slice(0, 10) : null, relances: logs};
+  return {sent: dayOf(p.mail_sent_at), relances: logs};   // jour de Paris (§1.2)
 }
 const historyText = (p, extra=[]) => { const h = relanceHistory(p); const r = [...h.relances, ...extra];
   return [h.sent && `prospection le ${fmtDate(h.sent)}`, r.length && `relance${r.length > 1 ? 's' : ''} le ${r.map(fmtDate).join(', ')}`].filter(Boolean).join(' · '); };
@@ -305,9 +329,8 @@ export async function restoreRelances(undo){
 async function relanceTask(st, pids, subject, sent, p, n, sentOn=today()){
   await closeOpenRelances(st, p);
   if (suiviClosed(p)) return;   // suivi confirmé ou clos : plus de relance
-  const due = new Date(sentOn + 'T12:00:00'); due.setDate(due.getDate() + RELANCE_DAYS);   // J+10 après l'envoi réel
-  // un samedi ou un dimanche : le lundi suivant
-  const deadline = workDay(`${due.getFullYear()}-${String(due.getMonth()+1).padStart(2,'0')}-${String(due.getDate()).padStart(2,'0')}`);
+  // J+10 après l'envoi réel ; un samedi ou un dimanche : le lundi suivant (fonctions officielles §1.6)
+  const deadline = workDay(addDays(sentOn, RELANCE_DAYS));
   const base = {department: 'Booking', status: 'To Do', assigned_to: S.user.email, deadline,
     structure_id: st.id, project_ids: pids, project_id: pids[0] || null, prospect_id: p?.id || null};
   if (p && n >= MAIL_RELANCES){
@@ -321,6 +344,24 @@ async function relanceTask(st, pids, subject, sent, p, n, sentOn=today()){
   }
   await insert('tasks', {...base, title: `Relance — ${st.name}`, auto_kind: 'relance_mail',
     notes: `${n ? `Relance n°${n}` : 'Mail'} « ${subject || ''} » ${sent ? 'envoyé le ' + fmtDate(sentOn) : 'préparé en brouillon le ' + fmtDate(today())}. Relance n°${n + 1} sur ${MAIL_RELANCES} par mail : bouton « Relance » sur le suivi ou la fiche de la structure.`});
+}
+
+/** Question de suppression d'un suivi : nomme le suivi et ce qui part avec lui (§4.4) */
+export function prospectDeleteAsk(id){
+  const p = byId('prospects', id), n = logsOf(id).length, f = filesOf(id).filter(x => x.mime !== 'link').length;
+  const plus = [n ? `son journal (${n} échange${n > 1 ? 's' : ''})` : '', f ? `${f} fichier${f > 1 ? 's' : ''} joint${f > 1 ? 's' : ''}` : ''].filter(Boolean).join(' et ');
+  return {title: 'Supprimer le suivi ?', text: `Supprimer le suivi « ${prospectTitle(p)} »${plus ? ' avec ' + plus : ''} ? Les fichiers Google Drive ne sont pas touchés.`,
+    actions: [{value: 'del', label: 'Supprimer le suivi', danger: true}]};
+}
+/** Suppression d'un suivi (liste ou fenêtre) : lignes d'abord, puis ses fichiers stockés — jamais de fichier orphelin silencieux (v1.46b) */
+export async function deleteProspect(id){
+  const paths = filesOf(id).filter(f => f.mime !== 'link').map(f => f.path);
+  if (!(await remove('prospects', id))) return false;
+  S.db.prospect_logs = S.db.prospect_logs.filter(l => l.prospect_id !== id); S.db.prospect_files = S.db.prospect_files.filter(f => f.prospect_id !== id);
+  touch('prospect_logs'); touch('prospect_files');
+  if (S.suiviPage === id) S.suiviPage = null;
+  await purgeStored(paths);
+  return true;
 }
 
 /** Relance téléphone sans réponse : la tâche est fermée, le suivi est clos et le journal le note */
@@ -357,10 +398,10 @@ export async function checkProspect(p, force=false){
       // un envoi postérieur à la préparation du brouillon (sinon il est toujours en brouillon)
       const after = log.created_at ? sent.find(d => d.slice(0, 19) >= log.created_at.slice(0, 19)) : null;
       if (after){
-        await save('prospect_logs', log.id, {date: after.slice(0, 10), body: String(log.body || '').replace(DRAFT_MARK, '')}, {rerender: false});
-        if (/^\*\*Relance n°/.test(log.body || '')) await relanceSent(byId('prospects', p.id), after.slice(0, 10));
+        await save('prospect_logs', log.id, {date: dayOf(after), body: String(log.body || '').replace(DRAFT_MARK, '')}, {rerender: false});
+        if (/^\*\*Relance n°/.test(log.body || '')) await relanceSent(byId('prospects', p.id), dayOf(after));
       }
-      if (after) patch.last_contact = [p.last_contact, after.slice(0, 10)].filter(Boolean).sort().pop();
+      if (after) patch.last_contact = [p.last_contact, dayOf(after)].filter(Boolean).sort().pop();
     }
     if (Object.keys(patch).length){ await save('prospects', p.id, patch, {rerender: false}); render(); }
   } catch (err) { /* script absent ou fil supprimé : on réessaiera à la prochaine session */ }
@@ -377,3 +418,16 @@ export const lastProspectMail = stId => prospectsOfStructure(stId).filter(p => p
   .sort((a, b) => (b.mail_sent_at || b.updated_at || '').localeCompare(a.mail_sent_at || a.updated_at || ''))[0] || null;
 
 export { PROSPECT_TAGS, logsOf };
+
+/** Lieu propre d'un suivi (v1.60.2) : enregistré en entier, ou retiré (pl = null) ; la carte de l'espace de prospection en part */
+export const PLACE_KEYS = ['venue', 'address', 'postal_code', 'city', 'department', 'lat', 'lng'];
+export async function setSuiviPlace(pid, pl){
+  const patch = Object.fromEntries(PLACE_KEYS.map(k => [k, pl?.[k] ?? null]));
+  // lieu connu sans coordonnées (événement dans une autre ville…) : localisé par son adresse ou sa ville, jamais par son seul nom
+  if (pl && patch.lat == null && (patch.address || patch.city)){
+    const fr = !patch.department || /^(\d{2,3}|2[AB])$/i.test(patch.department);
+    const g = await geocode([patch.address, patch.postal_code, patch.city, fr ? '' : patch.department].filter(Boolean).join(' '), {france: fr});
+    if (g){ patch.lat = g.lat; patch.lng = g.lng; patch.department = patch.department || g.department_code || null; }
+  }
+  if (await save('prospects', pid, patch)) toast(pl ? 'Lieu du suivi enregistré' : 'Lieu du suivi retiré');
+}

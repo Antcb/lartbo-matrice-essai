@@ -4,9 +4,9 @@
  */
 import { lingering } from '../data.js';
 import { distKm } from '../geo.js';
-import { suiviClosed, byId, eventsOfStructure, lastExchange, linksOfStructure, projName, prospectsOfStructure, showsOfStructure, tasksOfStructure } from '../selectors.js';
+import { suiviClosed, byId, eventsOfStructure, isInactive, relanceTaskSuspended, lastExchange, linkRole, linksOfContact, linksOfStructure, projName, prospectsOfStructure, showsOfStructure, tasksOfStructure } from '../selectors.js';
 import { S } from '../state.js';
-import { curTab, fold, pstBadge, stBadge, stSelect, tabsBar, tag, viewHead } from '../ui/bits.js';
+import { archivedTag, curTab, fold, pstBadge, stBadge, stSelect, tabsBar, tag, viewHead } from '../ui/bits.js';
 import { cAc, cIn, cSel } from '../ui/cells.js';
 import { EVENT_KINDS, PRICING, isOff } from '../constants.js';
 import { acInput } from '../ui/autocomplete.js';
@@ -17,7 +17,7 @@ import { taskSection } from './todo.js';
 
 // Coordonnées administratives (champ admin de la structure) : [clé, libellé, pleine largeur ?]
 export const ADMIN_FIELDS = [
-  ['legal_name','Raison sociale'], ['legal_form','Forme juridique'], ['siret','SIRET'], ['ape','Code APE / NAF'],
+  ['legal_name','Raison sociale'], ['legal_form','Forme juridique'], ['siret','SIRET'], ['ape','Code APE / NAF'], ['rna','N° RNA (association)'],
   ['vat','N° TVA intracommunautaire'], ['licence','Licence(s) d’entrepreneur de spectacles'],
   ['address','Adresse du siège',true], ['postal_code','Code postal'], ['city','Ville'], ['country','Pays'],
   ['vat_subject','Soumise à la TVA (Oui / Non)'],
@@ -36,7 +36,7 @@ export function structurePage(st){
   const events = eventsOfStructure(st.id);
   const openSuivis = suivis.filter(p=>!suiviClosed(p) || lingering(p.id));
   const tab = curTab('structure', 'home');
-  const tabs = tabsBar('structure', [['home','Accueil'], ['suivi','Suivi', openSuivis.length], ['dates','Dates', shows.filter(x=>!isOff(x.status)).length], ['tasks','Tâches', tasks.filter(t=>!['Done','Cancelled'].includes(t.status)).length],
+  const tabs = tabsBar('structure', [['home','Accueil'], ['suivi','Suivi', openSuivis.length], ['dates','Dates', shows.filter(x=>!isOff(x.status) && !x.archived_at).length], ['tasks','Tâches', tasks.filter(t=>!['Done','Cancelled'].includes(t.status)).length],
     ['events','Festivals / salles', events.length], ['admin','Coordonnées administratives']]);
   let body = '';
   if (tab==='home') body = homeTab(st, contacts, events) + `<div class="section-title">Tâches <span class="count">${tasks.filter(t=>!['Done','Cancelled'].includes(t.status)).length}</span><span class="spacer"></span><button class="btn sm" data-act="newTaskFor" data-id="${st.id}">Nouvelle tâche</button></div>${taskSection(tasks)}`;
@@ -49,24 +49,27 @@ export function structurePage(st){
   }
   else if (tab==='dates'){
     // Sans suite / annulées : repliées (elles n'ont pas eu lieu), dépliables si besoin
-    const live = shows.filter(x => !isOff(x.status)), off = shows.filter(x => isOff(x.status));
+    // dates archivées (v1.60.3) : avec les dates sans suite / annulées, signalées « date archivée » (historique de la structure)
+    const live = shows.filter(x => !isOff(x.status) && !x.archived_at), off = shows.filter(x => isOff(x.status) || x.archived_at);
     const table = list => `<div class="tbl-wrap"><table><thead><tr><th>Date</th><th>Artiste</th><th>Lieu</th><th>Statut</th><th class="num">Cachet</th><th>Contrat</th></tr></thead><tbody>
-      ${list.map(x=>`<tr class="click" data-act="editShow" data-id="${x.id}"><td class="nowrap">${fmtDate(x.date)}</td><td>${esc(projName(x.project_id))}</td><td>${esc(x.venue)}<span class="sub">${esc(x.city||'')}</span></td><td>${stSelect(x)}</td><td class="num">${eur(x.fee_ht)}</td><td>${esc(x.contract_type||'')}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">Aucune date en cours avec cette structure.</td></tr>'}
+      ${list.map(x=>`<tr class="click" data-act="editShow" data-id="${x.id}"><td class="nowrap">${fmtDate(x.date)}</td><td>${esc(projName(x.project_id))}</td><td>${esc(x.venue)}${archivedTag(x)}<span class="sub">${esc(x.city||'')}</span></td><td>${stSelect(x)}</td><td class="num">${eur(x.fee_ht)}</td><td>${esc(x.contract_type||'')}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">Aucune date en cours avec cette structure.</td></tr>'}
       </tbody></table></div>`;
     body = `<div class="vh-actions mb"><button class="btn primary" data-act="newShowFor" data-id="${st.id}">Nouvelle date</button></div>
-      ${table(live)}${off.length ? fold('struct-off-dates', 'Sans suite et annulées', table(off), {count: off.length}) : ''}`;
+      ${table(live)}${off.length ? fold('struct-off-dates', 'Sans suite, annulées et archivées', table(off), {count: off.length}) : ''}`;
   }
   else if (tab==='tasks') body = `<div class="vh-actions mb"><button class="btn primary" data-act="newTaskFor" data-id="${st.id}">Nouvelle tâche</button></div>${taskSection(tasks)}`;
   else if (tab==='events') body = eventsTab(st, events);
   else if (tab==='admin') body = adminTab(st);
   return `<button class="btn ghost back" data-act="closeStructure">← Structures</button>
+  ${isInactive(st) ? `<p class="mode-note">Structure <b>inactive</b> depuis le ${fmtDate(String(st.inactive_at).slice(0, 10))} : gardée avec ses contacts, suivis, dates et documents ; plus proposée par défaut. ${(n => n ? `${n} relance${n > 1 ? 's' : ''} automatique${n > 1 ? 's' : ''} suspendue${n > 1 ? 's' : ''} (contacts liés uniquement à des structures inactives). ` : '')(S.db.tasks.filter(t => relanceTaskSuspended(t) && byId('prospects', t.prospect_id)?.structure_id === st.id).length)}Ses contacts qui ne sont liés qu’à des structures inactives ne sont plus relancés ni proposés en prospection (désabonnements inchangés) ; la réactiver rétablit tout. <button class="btn sm" data-act="setStructureInactive" data-id="${st.id}" data-on="0">Réactiver</button></p>` : ''}
   ${viewHead(esc(st.name), {sub: esc([st.city, st.department_code && '('+st.department_code+')', st.region, st.country && st.country!=='France' ? st.country : ''].filter(Boolean).join(' · ')),
-    actions:`<button class="btn primary" data-act="prospection" data-id="${st.id}" title="Mail de prospection depuis un modèle : brouillon ou envoi, suivi et relance créés automatiquement">Prospection</button>
+    actions:`<button class="btn ${isInactive(st) ? '' : 'primary'}" data-act="prospection" data-id="${st.id}" title="Mail de prospection depuis un modèle : brouillon ou envoi, suivi et relance créés automatiquement">Prospection</button>
       ${(m => m ? `<button class="btn" data-act="relance" data-id="${m.id}" title="Relance en réponse au mail « ${esc(m.mail_subject || '')} »">Relance${m.relances ? ` (${m.relances + 1}e)` : ''}</button>` : '')(lastProspectMail(st.id))}
       <button class="btn" data-act="editStructure" data-id="${st.id}">Modifier la fiche</button>
       <button class="btn" data-act="newShowFor" data-id="${st.id}">Nouvelle date</button>
       <button class="btn" data-act="newTaskFor" data-id="${st.id}">Nouvelle tâche</button>
-      <button class="btn" data-act="newSuiviFor" data-id="${st.id}">Nouveau suivi</button>`})}
+      <button class="btn" data-act="newSuiviFor" data-id="${st.id}">Nouveau suivi</button>
+      ${isInactive(st) ? '' : `<button class="btn ghost" data-act="setStructureInactive" data-id="${st.id}" data-on="1" title="Structure fermée : gardée avec tout son historique, plus proposée par défaut">Marquer inactive</button>`}`})}
   ${tabs}${body}`;
 }
 
@@ -99,9 +102,11 @@ function homeTab(st, contacts, events){
       ${st.notes?`<div class="md mt">${md(st.notes)}</div>`:''}
       ${!facts.length && !st.notes ? '<p class="muted m0">« Modifier la fiche » pour ajouter l’adresse, le site…</p>' : ''}
     </div>
-    <div class="panel pad"><h3 class="block-title">Contacts <span class="count">${contacts.length}</span><span class="spacer"></span><button class="btn sm" data-act="newContactFor" data-id="${st.id}">Ajouter un contact</button></h3>
-      ${contacts.map(c=>`<div class="contact-row"><a href="#" data-act="editContact" data-id="${c.id}"><b>${esc(c.display_name)}</b></a>
-        <span class="muted">${esc((c.roles||[]).join(', '))}</span>
+    <div class="panel pad"><h3 class="block-title">Contacts <span class="count">${contacts.length}</span><span class="spacer"></span><button class="btn sm" data-act="newContactFor" data-id="${st.id}">Nouveau contact</button></h3>
+      <div class="attach-contact mb">${acInput('contacts', {attrs: `data-attach-contact="${st.id}" aria-label="Rattacher un contact existant"`, placeholder: 'Rattacher un contact existant (nom ou mail)…'})}</div>
+      ${contacts.map(c=>`<div class="contact-row"><a href="#" data-act="editContact" data-id="${c.id}"><b>${esc(c.display_name)}</b>${(c.roles||[]).includes('★')?' <span title="Contact principal">★</span>':''}</a>
+        ${roleCell(c, st)}
+        ${(others => others.length ? `<span class="muted small">aussi : ${others.map(o => esc(o.name)).join(', ')}</span>` : '')(linksOfContact(c.id).filter(o => o.id !== st.id))}
         <span class="links">${[c.email, c.email_2].filter(Boolean).map(m => `<a href="mailto:${esc(m)}">${esc(m)}</a>`).join('')}${[c.phone, c.phone_2].filter(Boolean).map(t => `<a href="tel:${esc(t.replace(/\s/g,''))}">${esc(t)}</a>`).join('')}</span></div>`).join('') || '<div class="muted">Aucun contact lié.</div>'}
     </div></div>`;
 }
@@ -149,8 +154,10 @@ export function viewStructures(){
   if (S.structurePage) return structurePage(byId('structures', S.structurePage));
   const words = norm(S.search.structures).split(/\s+/).filter(Boolean);
   const sel = S.structTags || [];
-  let rows = S.db.structures;
-  if (sel.length) rows = rows.filter(s => sel.every(t => (s.tags||[]).includes(t)));   // toutes les étiquettes choisies
+  // structures inactives (fermées, v1.54) : gardées, cachées par défaut, retrouvées avec « Afficher les inactives »
+  const nInactive = S.db.structures.filter(isInactive).length;
+  let rows = S.showInactiveStructs ? S.db.structures : S.db.structures.filter(s => !isInactive(s));
+  if (sel.length) rows = rows.filter(s => sel.some(t => (s.tags||[]).includes(t)));   // au moins un des types choisis (OU, décision d'Anthony du 01/11/2026)
   if (words.length) rows = rows.filter(s => { const hay = hayOf([s.name,...eventsOfStructure(s.id).map(e=>e.name),s.address,s.city,s.postal_code,s.department_code,s.department_name,s.region,s.country,...(s.tags||[]),
       // les contacts de la structure : nom, mails, téléphones (on retrouve une structure par le mail d'un de ses contacts)
       ...linksOfStructure(s.id).flatMap(c => [c.display_name, c.email, c.email_2, c.phone, c.phone_2])].join(' '));
@@ -188,13 +195,38 @@ export function viewStructures(){
       </span>
     </form>
     ${tagBar}
+    ${nInactive ? `<div class="vh-actions mb"><label class="chk"><input type="checkbox" data-act="toggleInactiveStructs" ${S.showInactiveStructs ? 'checked' : ''}><span>Afficher les structures inactives (${nInactive})</span></label></div>` : ''}
     ${near?'<p class="help" style="margin:-6px 0 12px">Seules les structures dont la ville est connue apparaissent dans la recherche par distance.</p>':''}
     <div class="tbl-wrap"><table><thead><tr><th>Structure</th><th>Ville</th><th>Département · région</th><th class="num">Jauge</th><th class="num">Contacts</th><th>Suivi</th></tr></thead><tbody>
     ${rows.slice(0,300).map(s=>{ const ps = prospectsOfStructure(s.id); return `<tr class="click" data-act="openStructure" data-id="${s.id}">
-      <td class="struct-name"><b>${esc(s.name)}</b>${(s.tags||[]).length?`<div class="proj-chips mt-sm">${s.tags.map(tagLink).join('')}</div>`:''}</td>
+      <td class="struct-name"><b>${esc(s.name)}</b>${isInactive(s) ? ' <span class="badge">Inactive</span>' : ''}${(s.tags||[]).length?`<div class="proj-chips mt-sm">${s.tags.map(tagLink).join('')}</div>`:''}</td>
       <td>${esc(s.city||'')}${near?` <span class="muted">· ${Math.round(dist.get(s.id))} km</span>`:''}${s.country && s.country!=='France'?`<span class="sub">${esc(s.country)}</span>`:''}</td>
       <td>${esc(s.department_code ? `${s.department_code} ${s.department_name||''}` : '')}<span class="sub">${esc(s.region||'')}</span></td>
       <td class="num">${[...new Set(eventsOfStructure(s.id).map(e=>e.capacity).filter(Boolean))].join(' / ')}</td>
       <td class="num">${linksOfStructure(s.id).length||''}</td><td>${ps.map(x=>pstBadge(x.status)).join(' ')}</td></tr>`; }).join('') || '<tr><td colspan="6" class="empty">Aucune structure ne correspond. Crée-la avec « Nouvelle structure ».</td></tr>'}
     </tbody></table>${rows.length>300?`<p class="muted" style="padding:10px 12px;margin:0">300 premiers résultats affichés — affine la recherche.</p>`:''}</div>`;
+}
+
+/**
+ * Fonction d'un contact dans une structure (correction du 05/11/2026) : les fonctions du contact (contacts.roles, « Poste(s) »)
+ * restent la référence et s'affichent ; une fonction propre à CETTE structure (contact_structures.role) n'est saisie que si besoin,
+ * ne touche ni la fiche du contact ni ses autres structures, et s'efface pour revenir à la référence. Aucune recopie automatique.
+ */
+export const refRoles = c => (c.roles || []).filter(r => r !== '★').join(', ');   // ★ = contact principal, pas une fonction
+function roleCell(c, st){
+  const own = linkRole(c.id, st.id), ref = refRoles(c), key = `${c.id}|${st.id}`;
+  if (S.editRole === key){
+    // modifiée ailleurs depuis l'ouverture : signalée, jamais remplacée sans un nouvel « Enregistrer »
+    const moved = (S.editRoleBase ?? null) !== (own ?? null), warned = !moved && S.editRoleWarn;
+    return `<span class="role-edit"><input class="inp link-role" data-link-role="1" data-c="${c.id}" data-s="${st.id}" value="${esc(S.editRoleDraft ?? (own || ref))}" placeholder="Fonction dans cette structure" aria-label="Fonction de ${esc(c.display_name)} dans cette structure">
+      <button type="button" class="btn sm primary" data-act="saveLinkRole" data-c="${c.id}" data-s="${st.id}">Enregistrer</button>
+      <button type="button" class="btn sm ghost" data-act="editLinkRole" data-key="">Annuler</button>${moved || warned ? `
+      <span class="warn-txt small">Modifiée ailleurs entre-temps : ${own ? `« ${esc(own)} »` : 'fonctions du contact'}${warned ? ' ; « Enregistrer » la remplacera par ta saisie' : ''}</span>` : ''}</span>`;
+  }
+  return own
+    ? `<span class="role-view"><span title="Fonction propre à cette structure${ref ? ` (fonctions du contact : ${esc(ref)})` : ''}">${esc(own)} <span class="muted small">· ici</span></span>
+        <button type="button" class="btn sm ghost" data-act="editLinkRole" data-key="${esc(key)}">Modifier</button>
+        <button type="button" class="btn sm ghost" data-act="resetLinkRole" data-c="${c.id}" data-s="${st.id}" title="Revenir aux fonctions du contact${ref ? ` : ${esc(ref)}` : ''}">Fonctions du contact</button></span>`
+    : `<span class="role-view"><span class="muted">${ref ? esc(ref) : 'Fonction non renseignée'}</span>
+        <button type="button" class="btn sm ghost" data-act="editLinkRole" data-key="${esc(key)}">Modifier la fonction dans cette structure</button></span>`;
 }

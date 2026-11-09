@@ -8,7 +8,7 @@ import { TEAM_NAMES } from './constants.js';
 import { LINGER_MS } from './constants.js';
 import { byId, linksOfStructure } from './selectors.js';
 import { S, TABLES, localGet, localSet, touch } from './state.js';
-import { toast } from './utils.js';
+import { toast, today } from './utils.js';
 
 export const sb = window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY);
 
@@ -25,12 +25,15 @@ export async function fetchAll(table){
   let out = [], from = 0, size = 1000;
   for(;;){
     const {data, error} = await sb.from(table).select('*').range(from, from+size-1);
-    if (error) { if (!/does not exist/.test(error.message)) toast(`Chargement ${table} : ${error.message}`, true); return out; }
+    if (error) { if (!/does not exist|schema cache/.test(error.message)) toast(`Chargement ${table} : ${error.message}`, true); return out; }
     out = out.concat(data); if (data.length < size) return out; from += size;
   }
 }
 
-let saveGuard = null, saveComplement = null;
+let saveGuard = null, saveComplement = null, saveConfirm = null;
+/** Confirmation demandée avant certains enregistrements (installée par actions.js : changement de cachet / % / mode d'une date qui
+ *  a déjà des factures émises ou des commissions versées, lot D1) ; renvoie false = rien n'est écrit */
+export const setSaveConfirm = f => { saveConfirm = f; };
 /** Garde-fou appelé avant chaque enregistrement (installé par actions.js : calc.changeBlocked) ; message = refus */
 export const setSaveGuard = f => { saveGuard = f; };
 /** Compléments écrits avec un enregistrement (installé par actions.js : calc.freezeOnEmit — montant du solde figé à l'émission) */
@@ -39,6 +42,7 @@ export const setSaveComplement = f => { saveComplement = f; };
 export async function save(table, id, patch, {rerender=true}={}){
   const why = saveGuard ? saveGuard(table, id, patch) : '';
   if (why){ toast(why, true); render(); return null; }   // refus : rien n'est écrit, l'affichage revient à la valeur enregistrée
+  if (saveConfirm && !(await saveConfirm(table, id, patch))){ render(); return null; }   // avertissement refusé : rien n'est écrit
   if (saveComplement) patch = {...patch, ...saveComplement(table, id, patch)};
   const row = byId(table, id); const before = row ? {...row} : null;
   if (row) Object.assign(row, patch);
@@ -49,7 +53,7 @@ export async function save(table, id, patch, {rerender=true}={}){
   touch(table);
   summaryAfter(table, row || data);
   if (table==='shows' && (patch.status || patch.project_id)) await refreshShowSide(id);
-  if (table==='shows' && ('ticketing_type' in patch || 'department' in patch || 'structure_id' in patch)) await (await import('./budget-actions.js')).syncCnmLine(id);
+  if (table==='shows' && ('ticketing_type' in patch || 'department' in patch || 'structure_id' in patch || 'cnm_bearer' in patch || 'contract_type' in patch)) await (await import('./budget-actions.js')).syncCnmLine(id);
   if (rerender) render();
   return before || {};   // réussi (même si la ligne n'était pas encore en mémoire)
 }
@@ -121,9 +125,69 @@ export async function remove(table, id){
   if (why){ toast(why, true); return false; }
   const before = byId(table, id);
   const {error} = await sb.from(table).delete().eq('id', id);
-  if (error){ toast('Suppression impossible : '+error.message, true); return false; }
+  if (error){ toast('Suppression impossible : '+dbErrorText(error), true); return false; }
   S.db[table] = S.db[table].filter(r => r.id !== id); touch(table);
   summaryAfter(table, before);
+  return true;
+}
+
+/** Message d'erreur de la base pour l'utilisateur (v1.60.3) : jamais le texte technique d'une clé étrangère (code 23503) */
+export const dbErrorText = error => error?.code === '23503'
+  ? 'cet élément est encore relié à d’autres données de la Matrice (historique, tâches ou documents). Rien n’a été supprimé.'
+  : error?.message || 'erreur inconnue';
+/** Fonction serveur absente (migration pas encore appliquée) */
+const missingFunction = error => error?.code === 'PGRST202' || /Could not find the function|schema cache/i.test(error?.message || '');
+
+/** Ce que la suppression d'une date ferait, vu par le serveur (v1.60.3, fonction show_deletion_state) :
+ *  {blocked: [motifs], payments, budget_lines, tasks, closures} ; null si le serveur n'a pas encore la fonction ou ne répond pas. */
+export async function showDeletionState(id){
+  const {data, error} = await sb.rpc('show_deletion_state', {p_show: id});
+  if (error) return missingFunction(error) ? null : {blocked: [error.code === 'P0001' ? error.message : 'Suppression impossible : ' + dbErrorText(error)]};
+  return data;
+}
+
+/**
+ * Suppression contrôlée d'une date (v1.60.3, demande d'Anthony du 07/11) : fonction serveur delete_show — refus motivés (résultat
+ * clôturé, factures émises, documents Pennylane, pièces à rattacher…), copie complète dans le journal des suppressions (historique de
+ * clôture / réouverture compris), tâches gardées sans lien, puis la date avec ses lignes de facturation (aucune émise) et de budget.
+ * Même garde-fou que remove (calc.changeBlocked) avant tout appel. Serveur sans la fonction (migration pas encore appliquée) :
+ * suppression directe comme avant, erreur de clé étrangère traduite.
+ */
+export async function deleteShow(id){
+  const why = saveGuard ? saveGuard('shows', id, null) : '';
+  if (why){ toast(why, true); return false; }
+  const {data, error} = await sb.rpc('delete_show', {p_show: id});
+  if (error && missingFunction(error)) return remove('shows', id);
+  if (error){ toast(error.code === 'P0001' ? error.message : 'Suppression impossible : ' + dbErrorText(error), true); return false; }
+  for (const t of ['show_payments', 'budget_lines', 'pennylane_a_rattacher']) if (S.db[t]){ S.db[t] = S.db[t].filter(r => r.show_id !== id); touch(t); }
+  S.db.shows = S.db.shows.filter(r => r.id !== id); touch('shows');
+  // tâches gardées, détachées, avec la mention « Date supprimée le … » en tête de leur note (écrite par le serveur) : relues
+  const tids = data?.task_ids || S.db.tasks.filter(t => t.show_id === id).map(t => t.id);
+  S.db.tasks.forEach(t => { if (t.show_id === id) t.show_id = null; }); touch('tasks');
+  if (tids.length) await refreshFor('tasks', 'id', tids);
+  return data || true;
+}
+
+/** Archivage d'une date (v1.60.3, fonction serveur archive_show) : motif obligatoire ; refus du serveur affiché tel quel */
+export async function archiveShow(id, reason){
+  const {error} = await sb.rpc('archive_show', {p_show: id, p_reason: reason});
+  if (error){ toast(missingFunction(error) ? 'L’archivage des dates n’est pas encore installé sur le serveur.' : error.code === 'P0001' ? error.message : 'Archivage impossible : ' + dbErrorText(error), true); return false; }
+  // la date reste dans les données (vues financières) ; ses notifications sont retirées de la liste active par le serveur
+  await refreshFor('shows', 'id', [id]); await refreshFor('notifications', 'show_id', [id]);
+  return true;
+}
+/** Réactivation explicite des relances d'une date restaurée (fonction serveur reactivate_reminders) : next = {relance: 'AAAA-MM-JJ'} */
+export async function reactivateReminders(id, next){
+  const {error} = await sb.rpc('reactivate_reminders', {p_show: id, p_next: next});
+  if (error){ toast(error.code === 'P0001' ? error.message : 'Réactivation impossible : ' + dbErrorText(error), true); return false; }
+  await refreshFor('shows', 'id', [id]);
+  return true;
+}
+/** Restauration d'une date archivée (fonction serveur restore_show) : elle revient partout, avec ses lignes */
+export async function restoreShow(id){
+  const {error} = await sb.rpc('restore_show', {p_show: id});
+  if (error){ toast(error.code === 'P0001' ? error.message : 'Restauration impossible : ' + dbErrorText(error), true); return false; }
+  await refreshFor('shows', 'id', [id]); await refreshFor('notifications', 'show_id', [id]);
   return true;
 }
 
@@ -204,6 +268,16 @@ export function planRetries(){
     planRetries();
   }, Math.max(1000, next - Date.now()));
 }
+/** Fichiers stockés (espace « suivi ») d'un élément supprimé : effacés APRÈS la suppression réussie de ses lignes (§4.4, v1.46b).
+ *  Un échec est signalé, jamais silencieux. Les fichiers Google Drive ne sont jamais touchés. */
+export async function purgeStored(paths){
+  paths = [...new Set((paths || []).filter(Boolean))];
+  if (!paths.length) return true;
+  const {error} = await sb.storage.from('suivi').remove(paths);
+  if (error){ toast(`Supprimé, mais ${paths.length > 1 ? paths.length + ' fichiers n’ont' : '1 fichier n’a'} pas pu être effacé${paths.length > 1 ? 's' : ''} du stockage : ${error.message}`, true); return false; }
+  return true;
+}
+
 /** Supprime les lignes liées (tables sans cascade) */
 export async function removeWhere(table, col, val){
   const {error} = await sb.from(table).delete().eq(col, val);
@@ -228,6 +302,32 @@ export async function syncLinks(kind, id, ids){
   touch('contact_structures');
 }
 
+/**
+ * Type d'un fichier envoyé au stockage : celui donné par le navigateur, sinon déduit de l'extension pour les photos et PDF
+ * (v1.60.2 : une photo arrivée sans type était enregistrée en « application/octet-stream » et se téléchargeait au lieu de s'afficher).
+ * Même correspondance que la fonction serveur lire-piece.
+ */
+const EXT_TYPES = {jpg: 'image/jpeg', jpeg: 'image/jpeg', jfif: 'image/jpeg', png: 'image/png', heic: 'image/heic', heif: 'image/heif', pdf: 'application/pdf', eml: 'message/rfc822'};
+export const contentTypeOf = f => f?.type || EXT_TYPES[(String(f?.name || '').match(/\.([a-z0-9]+)$/i) || [])[1]?.toLowerCase()] || 'application/octet-stream';
+/**
+ * Fichier tel qu'envoyé au stockage, avec son type DANS le fichier (v1.60.3) : la bibliothèque Supabase envoie un fichier
+ * en formulaire et ignore alors l'option contentType ; sans cela, un .eml ou une photo arrivés sans type restaient « octet-stream ».
+ */
+export const typedFile = f => { const type = contentTypeOf(f); return f.type === type ? f : new File([f], f.name, {type, lastModified: f.lastModified}); };
+/**
+ * Motif lisible d'un envoi au stockage qui n'a pas abouti à cause du réseau (« Failed to fetch ») : fichier devenu illisible
+ * (fichier temporaire d'une autre application effacé ou modifié) ou connexion au serveur impossible.
+ */
+export async function uploadFailure(file, err){
+  let readable = true; try { await file.slice(0, 1).arrayBuffer(); } catch { readable = false; }
+  const why = readable ? `connexion au stockage impossible (${err?.message || 'réseau'})` : 'le fichier n’est plus lisible par le navigateur : l’application d’où il vient l’a effacé ou modifié';
+  const data = {lisible: readable, erreur: `${err?.name || ''}: ${err?.message || ''}`,
+    ext: (String(file.name || '').match(/\.([a-z0-9]{1,8})$/i) || [])[1]?.toLowerCase() || '', taille: file.size, type: file.type || ''};
+  console.info('[Matrice] envoi au stockage : échec réseau', JSON.stringify(data));
+  window.dispatchEvent(new CustomEvent('matrice-diag', {detail: {key: 'envoi au stockage : échec réseau', data}}));
+  return why;
+}
+
 const safeName = n => n.normalize('NFD').replace(/[̀-ͯ]/g,'').replace(/[^\w.\-]+/g,'_') || 'fichier';
 
 /**
@@ -239,15 +339,27 @@ export async function uploadFiles(owner, files){
   const table = owner.prospect_id ? 'prospect_files' : 'attachments';
   const folder = owner.prospect_id || (owner.task_id ? 'task/' + owner.task_id : 'project/' + owner.project_id);
   toast(`Envoi de ${files.length} fichier(s)…`);
-  let ok = 0;
+  let ok = 0; const done = [], failed = [];
   for (const file of files){
     const path = `${folder}/${Date.now()}_${safeName(file.name)}`;
-    const {error} = await sb.storage.from('suivi').upload(path, file, {contentType: file.type||'application/octet-stream', upsert:false});
-    if (error){ toast(`${file.name} : ${error.message}`, true); continue; }
-    if (await insert(table, {...owner, name:file.name, path, size:file.size, mime:file.type||null})) ok++;
+    if (!file.size){ failed.push([file.name, 'fichier vide ou illisible (un élément glissé depuis une messagerie n’est pas toujours un vrai fichier)']); continue; }
+    const type = contentTypeOf(file);
+    // (v1.60.3) une erreur réseau (« Failed to fetch ») n'est plus une exception non traitée qui arrête tout l'envoi :
+    // elle est expliquée dans le bilan, fichier par fichier
+    let error;
+    try { ({error} = await sb.storage.from('suivi').upload(path, typedFile(file), {contentType: type, upsert:false})); }
+    catch (err){ failed.push([file.name, await uploadFailure(file, err)]); continue; }
+    if (error){ failed.push([file.name, error.message]); continue; }
+    if (await insert(table, {...owner, name:file.name, path, size:file.size, mime: type === 'application/octet-stream' ? (file.type || null) : type})){ ok++; done.push(file.name); }
+    else failed.push([file.name, 'enregistrement refusé (voir le message affiché)']);
     if (owner.prospect_id) await emlToJournal(owner.prospect_id, file);
   }
-  if (ok) toast(`${ok} fichier(s) ajouté(s)`);
+  // bilan qui reste affiché tant qu'on ne le ferme pas : fichiers ajoutés et refusés, avec le motif (v1.53, aucune perte silencieuse)
+  if (failed.length){
+    const {inform} = await import('./ui/dialog.js');
+    await inform({title: `${ok} fichier${ok > 1 ? 's' : ''} ajouté${ok > 1 ? 's' : ''}, ${failed.length} refusé${failed.length > 1 ? 's' : ''}`,
+      text: [...done.map(n => `✓ ${n}`), ...failed.map(([n, why]) => `✗ ${n} — ${why}`)].join('\n')});
+  } else if (ok) toast(`${ok} fichier${ok > 1 ? 's' : ''} ajouté${ok > 1 ? 's' : ''} : ${done.join(', ')}`);
   return ok;
 }
 
@@ -267,7 +379,7 @@ async function emlToJournal(pid, file){
   const contacts = linksOfStructure(p.structure_id);
   const c = contacts.find(x => [x.email, x.email_2].some(e => e && e.toLowerCase() === mail));
   const body = `${sent ? 'Envoyé' : 'Reçu'}${m.subject ? ` — **${m.subject}**` : ''}\n\n${m.text || '(mail sans texte)'}`;
-  const date = m.date || new Date().toISOString().slice(0, 10);
+  const date = m.date || today();   // jour de Paris (§1.2)
   if (S.db.prospect_logs.some(l => l.prospect_id === pid && l.date === date && l.body === body)) return;
   const row = await insert('prospect_logs', {prospect_id: pid, date, kind: 'Mail', contact_name: c?.display_name || name || mail || null,
     contact_id: c?.id || null, body, author: S.user?.email});

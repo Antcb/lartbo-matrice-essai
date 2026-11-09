@@ -1,10 +1,20 @@
 /**
  * 🧮 Calculs financiers : acomptes, solde, commission L'ArtBo, part partenaire, net.
  */
-import { byId } from './selectors.js';
+import { r2, eur2 } from './utils.js';
+import { byId, showCommissionPct } from './selectors.js';
 import { S } from './state.js';
+import { commissionBase } from './corea.js';
 
-export function paymentsOf(showId){ return S.db.show_payments.filter(p=>p.show_id===showId).sort((a,b)=>(a.sort||0)-(b.sort||0)); }
+/** Lignes financières d'une date QUI COMPTENT : une ligne « hors calcul » (coproduction, import — v1.44) est gardée pour la traçabilité
+ *  mais n'entre dans aucun calcul, indicateur, compte, rappel ni opération Pennylane. Même règle côté base : payment_is_emitted, rappels. */
+export const counted = p => !!p && (p.hors_calcul == null || p.hors_calcul === '');
+export function paymentsOf(showId){ return allPaymentsOf(showId).filter(counted); }
+/** Toutes les lignes, y compris hors calcul (affichage de traçabilité seulement) */
+export function allPaymentsOf(showId){ return S.db.show_payments.filter(p=>p.show_id===showId).sort((a,b)=>(a.sort||0)-(b.sort||0)); }
+/** Coproduction (décision d'Anthony du 27/10/2026) : ni facture de cession, ni acompte, ni solde, ni commission générés ;
+ *  seules ses opérations réelles, ajoutées à la main, comptent. Même règle côté base : on_show_confirmed, ensure_production_payments. */
+export const isCoproduction = s => s?.contract_type === 'Co-Production';
 
 export function payAmount(p){
   if (p.amount!=null && p.amount!=='') return Number(p.amount);
@@ -12,10 +22,30 @@ export function payAmount(p){
   // production : solde pas encore facturé = cession − acomptes EFFECTIVEMENT facturés (règle d'Anthony du 26/10, lot C1).
   // Un acompte seulement prévu ne le réduit pas. Un solde facturé garde son montant (jamais recalculé, §6.4).
   if (p.kind==='solde' && s && !isBookingShow(s) && !isInvoiced(p)) return soldeDue(p.show_id, p.id);
-  if (p.kind==='artbo')   return Math.round(fee * (Number(p.pct ?? s.artbo_pct)||0)) / 100;
-  if (p.kind==='partner') return Math.round(fee * (Number(s.artbo_pct)||0) * (Number(p.pct ?? s.partner_pct)||0) / 100) / 100;
+  // commission : % de la ligne > % de la date > % de l'artiste > Réglages selon le mode de la date (§6.3, v1.46a — plus de 0 ni de 15 en dur)
+  // base : cachet HT, plus la part du résultat validée en coréalisation (rémunération brute de l'artiste, v1.51)
+  if (p.kind==='artbo')   return Math.round(commissionBase(s) * (filled(p.pct) ? Number(p.pct) : showCommissionPct(s))) / 100;
+  if (p.kind==='partner') return Math.round(commissionBase(s) * showCommissionPct(s) * (Number(p.pct ?? s.partner_pct)||0) / 100) / 100;
   if (p.kind==='cnm' || p.pct==null || p.pct==='') return null;
   return Math.round(fee * Number(p.pct)) / 100;
+}
+
+/**
+ * Commission de PRODUCTION (lot D1, option B décidée par Anthony le 27/10) : un montant TOTAL dû (la ligne, unique par date)
+ * et l'historique des VERSEMENTS réels (table commission_transfers : montant, date, référence).
+ *  - déjà transféré = somme des versements ; reste = total − déjà transféré ; « versée » seulement quand le reste est nul ;
+ *  - commission marquée versée avant ce lot, sans versement détaillé : versée en totalité à sa date (compatibilité).
+ * Même règle côté base : commission_total, commission_transferred, déclencheurs de la migration v1.43.
+ */
+export const transfersOf = payId => (S.db.commission_transfers || []).filter(t => t.payment_id === payId)
+  .sort((a, b) => String(a.transferred_at).localeCompare(String(b.transferred_at)) || String(a.created_at || '').localeCompare(String(b.created_at || '')));
+export const isProdCommission = p => !!p && p.kind === 'artbo' && !isBookingShow(byId('shows', p.show_id));
+export function commissionState(p){
+  const total = Math.round((payAmount(p) || 0) * 100) / 100, list = p ? transfersOf(p.id) : [];
+  const legacy = !list.length && !!p?.paid_at;
+  const transferred = legacy ? total : Math.round(list.reduce((t, x) => t + Number(x.amount || 0), 0) * 100) / 100;
+  const remaining = Math.max(0, Math.round((total - transferred) * 100) / 100);
+  return {total, transferred, remaining, transfers: list, legacy, full: transferred > 0 && remaining < 0.005, partial: transferred > 0 && remaining >= 0.005};
 }
 
 export function netArtbo(s){
@@ -28,7 +58,7 @@ export function netArtbo(s){
 export function payPct(p){
   const s = byId('shows', p.show_id);
   if (p.pct!=null) return p.pct;
-  if (p.kind==='artbo') return s?.artbo_pct;
+  if (p.kind==='artbo') return s ? showCommissionPct(s) : null;
   if (p.kind==='partner') return s?.partner_pct;
   return null;
 }
@@ -48,6 +78,12 @@ export const tracked = p => !!p && !(isBookingShow(byId('shows', p.show_id)) && 
 
 /** TVA : 5,5 % sur les cachets (cession, co-réalisation…), 20 % sur les commissions. Modifiable par date / par ligne. */
 export const showVat = s => s?.vat_rate ?? 5.5;
+/** Régime de TVA : la structure administrative de l'artiste fait référence (05/11/2026). En booking, c'est elle qui contractualise :
+ *  « non soumise » alors que la date n'est pas à 0 % → à vérifier (TTC = HT attendu), jamais corrigé automatiquement. */
+export const vatConflict = s => { if (s?.prod_mode !== 'booking') return false;
+  const adm = byId('structures', byId('projects', s.project_id)?.admin_structure_id)?.admin;
+  return /^\s*non\b/i.test(adm?.vat_subject || '') && Number(s.vat_rate ?? 5.5) !== 0; };
+
 /** TVA d'une ligne. En production, la commission L'ArtBo n'est pas facturée (L'ArtBo se la verse) : pas de TVA. */
 export const selfPaidCommission = p => p.kind === 'artbo' && byId('shows', p.show_id)?.prod_mode !== 'booking';
 export const payVat = p => selfPaidCommission(p) ? 0 : p.vat_rate ?? (['artbo','partner'].includes(p.kind) ? 20 : showVat(byId('shows', p.show_id)));
@@ -62,6 +98,9 @@ export const isInvoiced = p => !!(p && (selfPaidCommission(p) ? filled(p.paid_at
 /** Ce qui rend une facture « émise » : une fois rempli, aucun de ces champs ne s'efface (sinon la facture se déverrouillerait).
  *  Même règle côté base : déclencheur show_payments_emitted_guard (supabase/migrations/2026-10-24_v1.40_factures_emises.sql). */
 export const EMITTED_FIELDS = ['sent_at', 'paid_at', 'invoice_number', 'pennylane_id'];
+/** Date « engagée » : une de ses lignes porte une opération enregistrée (quel que soit le mode). Son mode ne change plus,
+ *  ni directement ni par l'artiste (lot D1). Même règle côté base : show_has_financial_record. */
+export const hasFinancialRecord = showId => paymentsOf(showId).some(p => EMITTED_FIELDS.some(k => filled(p[k])) || (p.kind === 'artbo' && transfersOf(p.id).length > 0));   // un versement de commission engage aussi la date (v1.43)
 /** Champs qui figent une ligne : commission de production = seulement sa date de versement */
 export const emittedFieldsOf = p => selfPaidCommission(p) ? ['paid_at'] : EMITTED_FIELDS;
 /** Acompte : 'facture' (émis), 'prevu' (au contrat, pas encore facturé), 'caduc' (jamais facturé alors que le solde l'est :
@@ -89,6 +128,8 @@ export function billLockReason(p){
   if (!p) return '';
   if (isInvoiced(p)) return selfPaidCommission(p) ? 'Commission déjà versée : elle ne se modifie plus.' : 'Facture déjà émise (envoyée, numérotée, dans Pennylane ou payée) : elle ne se modifie plus.';
   if (p.kind === 'acompte' && soldeInvoiced(p.show_id)) return 'Le solde de cette date est déjà facturé : les acomptes ne peuvent plus changer.';
+  // commission de production versée en partie (lot D1) : son total est figé dès le premier versement (base : show_payments_commission_lock)
+  if (p.kind === 'artbo' && transfersOf(p.id).length) return 'Commission en partie versée : son montant total ne se modifie plus (note les versements restants).';
   return '';
 }
 
@@ -106,39 +147,85 @@ export const piecesToAttach = s => !s ? [] : S.db.attachments.filter(a => pieceS
 /** Toutes les pièces à rattacher (dates supprimées ou hors de la liste Production comprises : jamais introuvables) */
 export const allPiecesToAttach = () => S.db.attachments.filter(a => { const id = pieceShowId(a); return id && !id.startsWith('projet-') && pieceFree(a); });
 
+/** Lignes dont le montant est figé dès qu'elles sont émises / versées (lot D1) : la CNM n'a pas de montant calculé */
+export const FROZEN_KINDS = ['acompte', 'solde', 'autre', 'artbo', 'partner'];
 /**
- * Complément d'un enregistrement (appelé par data.save) : quand un solde de production DEVIENT émis (numéro, envoi, paiement ou
- * lien Pennylane saisi), son montant est figé à ce moment-là (cession − acomptes facturés) pour ne plus jamais bouger (lot C1).
- * Un montant déjà saisi à la main est gardé tel quel.
+ * Complément d'un enregistrement (appelé par data.save) : quand une ligne DEVIENT émise ou versée — facture d'acompte / de solde
+ * envoyée, payée, numérotée ou liée à Pennylane ; commission ou part partenaire versée — son montant calculé à ce moment-là est
+ * enregistré et ne bougera plus jamais, même si le cachet ou un % change ensuite (lot C1 pour le solde, lot D1 pour toutes).
+ * Un montant déjà saisi à la main est gardé tel quel. Même règle côté base : déclencheur show_payments_freeze (migration v1.42).
  */
 export function freezeOnEmit(table, id, patch){
   if (table !== 'show_payments' || !patch) return {};
   const row = byId('show_payments', id);
-  if (!row || row.kind !== 'solde' || isInvoiced(row) || (row.amount != null && row.amount !== '') || 'amount' in patch) return {};
+  if (!row || !FROZEN_KINDS.includes(row.kind) || isInvoiced(row) || (row.amount != null && row.amount !== '') || 'amount' in patch) return {};
+  if (!isInvoiced({...row, ...patch})) return {};
   const s = byId('shows', row.show_id);
-  if (isBookingShow(s) || !isInvoiced({...row, ...patch})) return {};
-  if (s?.fee_ht == null || s.fee_ht === '') return {};   // cession pas encore saisie : rien à figer (jamais un solde figé à 0 €)
-  if (multiSolde(row.show_id)) return {};                // plusieurs soldes (anomalie signalée) : rien n'est figé automatiquement
-  return {amount: soldeDue(row.show_id, row.id)};
+  if (s?.fee_ht == null || s.fee_ht === '') return {};   // cession pas encore saisie : rien à figer (jamais un montant figé à 0 €)
+  if (row.kind === 'solde' && multiSolde(row.show_id)) return {};   // plusieurs soldes (anomalie signalée) : rien n'est figé automatiquement
+  const amount = row.kind === 'solde' && !isBookingShow(s) ? soldeDue(row.show_id, row.id) : payAmount(row);
+  return amount == null ? {} : {amount};
 }
+/** Date qui a des lignes déjà émises ou versées : un changement de cachet / % / mode mérite un avertissement (lot D1) */
+export const emittedLinesOf = showId => paymentsOf(showId).filter(p => FROZEN_KINDS.includes(p.kind) && (isInvoiced(p) || (p.kind === 'artbo' && transfersOf(p.id).length)));
 
+/** Recette qualifiée d'une coproduction au résultat clôturé : verrouillée (même règle que la base : result_lock_payments, v1.51) */
+const closedReceiptLock = (p, patch) => { const s = p && byId('shows', p.show_id);
+  if (!s?.result_closed_at || (p.coprod_role == null && (patch == null || patch.coprod_role == null))) return '';
+  if (patch === null || ['coprod_role', 'coprod_holder', 'amount', 'pct', 'kind', 'show_id'].some(k => k in patch && String(patch[k] ?? '') !== String(p[k] ?? '')))
+    return 'Résultat clôturé : les recettes qualifiées de cette date sont verrouillées. Rouvre le résultat (avec un motif) pour les modifier.';
+  return ''; };
+/**
+ * Suppression et archivage d'une date (v1.60.3) : {blocked: refus de suppression, archiveBlocked: refus d'archivage}, dans
+ * l'ordre et avec les textes de la base (show_deletion_state, migration v1.60.3). Une date dont la suppression est refusée
+ * mais l'archivage permis (devis ou document Pennylane, lignes hors calcul…) peut être archivée (réponse d'Anthony du 07/11).
+ */
+export function showRemovalState(id){
+  const s = byId('shows', id), pays = allPaymentsOf(id), blocked = [], archiveBlocked = [], pl = (n, w) => n > 1 ? w + 's' : w;
+  if (s?.result_closed_at){
+    blocked.push('Le résultat de cette date est clôturé : rouvre-le d’abord (bouton « Rouvrir », avec un motif), puis supprime la date.');
+    archiveBlocked.push('Le résultat de cette date est clôturé : rouvre-le d’abord (bouton « Rouvrir », avec un motif).'); }
+  if (s?.archived_at) archiveBlocked.push('Cette date est déjà archivée.');
+  if (pays.some(p => !counted(p))) blocked.push('Cette date garde des lignes hors calcul (traçabilité) : elle ne se supprime pas.');
+  // comme la base : lors de la suppression en chaîne, la date n'existe plus pour le déclencheur, qui applique la définition
+  // complète — une commission de production numérotée (historique) empêche donc aussi la suppression de sa date
+  if (hasFinancialRecord(id)){
+    blocked.push('Cette date a des factures émises : elle ne se supprime pas (ses factures et son budget seraient effacés avec elle).');
+    archiveBlocked.push('Cette date a des factures émises ou des versements : elle reste dans les listes, les comptes et les relances (pas d’archivage).'); }
+  if (filled(s?.pennylane_quote_id) || filled(s?.pennylane_quote_url) || pays.some(p => filled(p.pennylane_url)))
+    blocked.push('Cette date est liée à un document Pennylane (devis ou facture) : elle ne se supprime pas (rien n’est jamais supprimé dans Pennylane, le document resterait sans sa date).');
+  const known = S.db.pennylane_a_rattacher.filter(r => r.show_id === id), n = known.length;
+  if (n) blocked.push(`Cette date a ${n} ${pl(n, 'facture')} Pennylane ${pl(n, 'connue')} de la synchronisation (à rattacher, rattachée ou annulée) : elle ne se supprime pas.`);
+  if (known.some(r => !r.resolved_at && !r.cancelled_at)) archiveBlocked.push('Cette date a une facture Pennylane à rattacher : rattache-la d’abord (onglet Factures).');
+  if (S.db.pennylane_rattachements.some(r => r.show_id === id)) blocked.push('Cette date a un historique de rattachement de factures Pennylane : elle ne se supprime pas (traçabilité).');
+  // pièces gardées « à rattacher » : la date ne se supprime pas tant qu'elles n'ont pas été rattachées (décision d'Anthony du 25/10)
+  const k = piecesToAttach(s).length;
+  if (k){ blocked.push(`Cette date a ${k} ${pl(k, 'pièce')} à rattacher (onglet Factures) : rattache-${k > 1 ? 'les' : 'la'} avant de supprimer la date.`);
+    archiveBlocked.push(`Cette date a ${k} ${pl(k, 'pièce')} à rattacher (onglet Factures) : rattache-${k > 1 ? 'les' : 'la'} d’abord.`); }
+  return {blocked, archiveBlocked};
+}
 export function changeBlocked(table, id, patch){
+  if (table === 'show_payments'){ const why = closedReceiptLock(byId('show_payments', id), patch); if (why) return why; }
   if (patch === null){
+    if (table === 'show_payments' && !counted(byId('show_payments', id))) return 'Ligne hors calcul (gardée pour la traçabilité) : elle ne se supprime pas.';
+    // suppression d'une date : refus de showRemovalState (même ordre et mêmes textes que la base, v1.60.3)
+    if (table === 'shows') return showRemovalState(id).blocked[0] || '';
     if (table === 'show_payments'){ const why = billLockReason(byId('show_payments', id)); return why && why.replace('ne se modifie plus', 'ne se supprime pas').replace('ne peuvent plus changer', 'ne se suppriment plus'); }
-    // comme la base : lors de la suppression en chaîne, la date n'existe plus pour le déclencheur, qui applique la définition
-    // complète — une commission de production numérotée (historique) empêche donc aussi la suppression de sa date
-    if (table === 'shows' && paymentsOf(id).some(p => isInvoiced(p) || EMITTED_FIELDS.some(k => filled(p[k])))) return 'Cette date a des factures émises : elle ne se supprime pas (ses factures et son budget seraient effacés avec elle).';
-    // pièces gardées « à rattacher » : la date ne se supprime pas tant qu'elles n'ont pas été rattachées (décision d'Anthony du 25/10)
-    if (table === 'shows'){ const n = piecesToAttach(byId('shows', id)).length;
-      if (n) return `Cette date a ${n} pièce${n > 1 ? 's' : ''} à rattacher (onglet Factures) : rattache-${n > 1 ? 'les' : 'la'} avant de supprimer la date.`; }
     return '';
   }
   if (!patch) return '';
   if (table === 'show_payments'){
     const row = byId('show_payments', id);
     if (!row) return '';
+    if (!counted(row)) return 'Ligne hors calcul (gardée pour la traçabilité) : elle ne se modifie plus.';
     const blank = v => v == null || String(v).trim() === '';
     // facture émise : ni numéro, ni date d'envoi, ni date de paiement, ni identifiant Pennylane ne s'efface (pas de déverrouillage)
+    // commission de production versée en partie (lot D1) : « versée » seulement quand tout est transféré — une date de versement
+    // ne remplace pas le versement du reste. Même règle côté base : show_payments_commission_lock (migration v1.43)
+    if (isProdCommission(row) && transfersOf(row.id).length && 'paid_at' in patch && !blank(patch.paid_at) && blank(row.paid_at)){
+      const st = commissionState(row);
+      if (st.remaining >= 0.005) return `Commission versée en partie : note le versement du reste (${eur2(st.remaining)}) au lieu d’une date de versement.`;
+    }
     if (isInvoiced(row) && emittedFieldsOf(row).some(k => k in patch && !blank(row[k]) && blank(patch[k])))
       return 'Facture déjà émise : son numéro, sa date d’envoi, sa date de paiement et son identifiant Pennylane ne s’effacent pas (une régularisation se décide à part).';
     // acompte caduc (date de production dont le solde est déjà facturé, lot C1) : il ne s'émet plus — sinon la date serait facturée
@@ -148,10 +235,17 @@ export function changeBlocked(table, id, patch){
     if (!['amount', 'pct', 'vat_rate', 'show_id', 'kind'].some(k => k in patch && !sameVal(patch[k], row[k]))) return '';
     return billLockReason(row);
   }
-  if (table === 'shows' && 'prod_mode' in patch && !sameVal(patch.prod_mode, byId('shows', id)?.prod_mode)
-      && paymentsOf(id).some(p => BILL_KINDS.includes(p.kind) && isInvoiced(p)))
-    return 'Cette date a des factures d’acompte ou de solde émises : son mode booking / production ne change plus (elles entreraient ou sortiraient du suivi de L’ArtBo). Une régularisation se décide à part.';
-  if (table === 'shows' && ['fee_ht', 'vat_rate', 'artbo_pct', 'partner_pct', 'prod_mode'].some(k => k in patch)){   // prod_mode : TVA de la commission
+  // mode d'une date engagée (lot D1, décisions du 26/10) : jamais changé — même définition large que la suppression d'une date.
+  // Même règle côté base : shows_frozen_guard, project_mode_to_shows, show_follow_project_mode (show_has_financial_record)
+  if (table === 'shows' && 'prod_mode' in patch && !sameVal(patch.prod_mode, byId('shows', id)?.prod_mode) && hasFinancialRecord(id))
+    return 'Cette date a des opérations financières enregistrées (facture, versement, numéro ou lien Pennylane) : son mode booking / production ne change plus. Une régularisation se décide à part.';
+  // TVA d'une date (lot D1, point 7) : refusée dès qu'une facture émise dépend de la TVA de la date (ligne sans TVA propre,
+  // hors commissions et parts à 20 %) — même règle que la base (shows_frozen_guard), même si le TTC calculé ne change pas
+  if (table === 'shows' && 'vat_rate' in patch && !sameVal(patch.vat_rate, byId('shows', id)?.vat_rate)
+      && paymentsOf(id).some(p => isInvoiced(p) && !filled(p.vat_rate) && !['artbo', 'partner'].includes(p.kind)))
+    return 'Des factures de cette date sont déjà émises avec la TVA de la date : la TVA ne change plus (leur montant TTC changerait). Une régularisation se décide à part.';
+  // corea_share / contract_type : base de la commission en coréalisation (MG + part validée, v1.51)
+  if (table === 'shows' && ['fee_ht', 'vat_rate', 'artbo_pct', 'partner_pct', 'prod_mode', 'corea_share', 'contract_type'].some(k => k in patch)){   // prod_mode : TVA de la commission
     const s = byId('shows', id), lines = s ? paymentsOf(id).filter(isInvoiced) : [];
     if (!lines.length) return '';
     const values = () => JSON.stringify(lines.map(p => { const a = payAmount(p); return [a, ttc(a, payVat(p))]; }));
@@ -167,7 +261,6 @@ export function changeBlocked(table, id, patch){
 
 /** Lignes qui facturent le cachet (acomptes, solde) : ensemble, 100 % du cachet au plus. Commissions, taxe CNM et « autres » à part. */
 export const BILL_KINDS = ['acompte', 'solde'];
-const r2 = n => Math.round(n * 100) / 100;
 /** % du cachet d'une ligne AU CONTRAT : saisi, ou déduit du montant HT saisi (conditions, mail, fiche, contrat) */
 export function billPct(p){
   const fee = Number(byId('shows', p.show_id)?.fee_ht) || 0;
@@ -215,7 +308,8 @@ export function financeOf(shows){
     }
     const bill = pays.filter(p => BILL_KINDS.includes(p.kind));
     const cashed = bill.filter(p => p.paid_at).reduce((t, p) => t + (payAmount(p) || 0), 0);
-    out.resteProd += Math.max(0, (Number(s.fee_ht) || 0) - cashed); out.datesProd++;
+    // coproduction : pas de cession à encaisser ; seules ses factures réelles (s'il y en a) restent à encaisser (27/10/2026)
+    out.resteProd += isCoproduction(s) ? bill.filter(p => !p.paid_at).reduce((t, p) => t + (payAmount(p) || 0), 0) : Math.max(0, (Number(s.fee_ht) || 0) - cashed); out.datesProd++;
     const due = bill.filter(p => isInvoiced(p) && !p.paid_at);
     out.impayesProd += due.reduce((t, p) => t + (payAmount(p) || 0), 0); out.factures += due.length;
   }

@@ -4,16 +4,20 @@
  */
 import { render } from './app.js';
 import { PROD_LINES, isProductionShow, prodOf } from './production-budget.js';
-import { cnmDue, isSolde, lineForecast, linesOf, prodShowsOf } from './budget.js';
-import { acompteState, isInvoiced, paymentsOf, payAmount } from './calc.js';
-import { insert, mergeRows, openStored, refreshFor, remove, save, sb } from './data.js';
+import { cnmDue, commissionOf, coreaCommissionCheck, isFree, isSolde, lineForecast, linesOf, prodShowsOf } from './budget.js';
+import { breakFromText, commissionPctOf, coreaCalc, isCorea } from './corea.js';
+import { acompteState, isCoproduction, isInvoiced, paymentsOf, payAmount } from './calc.js';
+import { contentTypeOf, insert, mergeRows, openStored, refreshFor, remove, save, sb, typedFile, uploadFailure } from './data.js';
 import { byId, membersOfProject, setting } from './selectors.js';
 import { callScript } from './mail.js';
-import { applyTemplate } from './budget-template.js';
+import { applyTemplate, offerCostFill, spectacleStaffRows } from './budget-template.js';
 import { exportArtistBudget } from './artist-export.js';
 import { S, touch } from './state.js';
 import { openModal } from './ui/modal.js';
-import { esc, eur2, fmtDate, norm, toast, today } from './utils.js';
+import { ask, askText, confirmAsk, inform } from './ui/dialog.js';
+import { PROMO_LEGACY_LABEL, coprodClose } from './production-budget.js';
+import { esc, eur2, fmtDate, norm, pct, toast, today } from './utils.js';
+import { takeDropped } from './ui/dropfiles.js';
 
 const nextSort = showId => Math.max(0, ...linesOf(showId).map(l => l.sort || 0)) + 1;
 const safeName = n => n.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^\w.\-]+/g, '_') || 'piece';
@@ -21,12 +25,13 @@ const simil = (a, b) => { a = norm(a||''); b = norm(b||''); if (!a || !b) return
   const wa = new Set(a.split(/\W+/).filter(w => w.length > 2)), wb = b.split(/\W+/).filter(w => w.length > 2);
   return wb.length ? wb.filter(w => wa.has(w)).length / Math.max(wa.size, wb.length) : 0; };
 
-/** Taxe CNM : la ligne n'existe que si la date est concernée (entrée gratuite, en France). Appelé quand la billetterie change. */
+/** Taxe CNM : la ligne n'existe que quand L'ArtBo en supporte le coût (v1.51 : gratuit par usage, ou attribuée sur la date), en France.
+ *  Appelé quand la billetterie, la structure qui supporte la taxe ou le contrat changent. */
 export async function syncCnmLine(showId){
   const s = byId('shows', showId); if (!s || !linesOf(s.id).length) return;
   const cnm = linesOf(s.id).filter(l => l.auto === 'cnm');
   if (cnmDue(s) && !cnm.length)
-    await insert('budget_lines', {project_id:s.project_id, show_id:s.id, category:'Taxes', label:'Taxe CNM (entrée gratuite)', supplier:'CNM', auto:'cnm', payer:'compte', sort: nextSort(s.id)});
+    await insert('budget_lines', {project_id:s.project_id, show_id:s.id, category:'Taxes', label: isFree(s) ? 'Taxe CNM (entrée gratuite)' : 'Taxe CNM (billetterie)', supplier:'CNM', auto:'cnm', payer:'compte', sort: nextSort(s.id)});
   if (!cnmDue(s)) for (const l of cnm) if (l.amount == null && l.forecast == null && !l.file_path && !l.doc_number && !l.paid_at) await remove('budget_lines', l.id);
 }
 
@@ -51,25 +56,125 @@ document.addEventListener('change', async e => {
   const el = e.target.closest?.('[data-prod-path]'); if (!el) return;
   e.stopPropagation();
   const path = el.dataset.prodPath.split('.'), raw = el.value.trim();
-  const v = /label/.test(path.at(-1)) ? raw : (raw === '' ? null : Number(raw.replace(',', '.')));
+  // textes : libellés, débiteur / payeur / date de paiement de la promotion locale (v1.51)
+  const v = /label|^(promo_(debtor|payer|paid_at)|receipts_cashed_at)$/.test(path.at(-1)) ? (raw === '' && !/label/.test(path.at(-1)) ? null : raw) : (raw === '' ? null : Number(raw.replace(',', '.')));
+  // parts de L'ArtBo (bénéfices, pertes) : un pourcentage de 0 à 100, sinon rien n'est enregistré
+  if (/^artbo_(loss_)?share$/.test(path.at(-1)) && v != null && !(v >= 0 && v <= 100)){ toast('Un pourcentage entre 0 et 100 est attendu', true); render(); return; }
   await saveProd(el.dataset.prodShow, p => { let o = p; path.slice(0, -1).forEach(k => { o = o[k]; }); o[path.at(-1)] = v; });
 }, true);
 
+/** Coréalisation : tarifs, break, méthode et charges enregistrés sur la date (shows.corea, v1.51) */
+async function saveCorea(showId, change){
+  const s = byId('shows', showId); if (!s) return;
+  const c = structuredClone(s.corea || {}); c.tiers ||= []; c.charges ||= []; change(c);
+  await save('shows', showId, {corea: c});
+}
+document.addEventListener('change', async e => {
+  const el = e.target.closest?.('[data-corea-path]'); if (!el) return;
+  e.stopPropagation();
+  const path = el.dataset.coreaPath.split('.'), raw = el.value.trim();
+  const v = /label/.test(path.at(-1)) ? raw : (raw === '' ? null : Number(raw.replace(',', '.')));
+  if (v !== null && typeof v === 'number' && (!isFinite(v) || v < 0)) { toast('Nombre positif attendu', true); render(); return; }
+  await saveCorea(el.dataset.coreaShow, c => { let o = c; path.slice(0, -1).forEach(k => { o = o[k]; }); o[path.at(-1)] = v; });
+}, true);
+const me = () => S.user?.email || '';
+/** Commission versée / facturée avant validation de la part du résultat (coréalisation) : avertissement NON bloquant, confirmation
+ *  explicite du caractère provisoire (décision d'Anthony du 27/10/2026, 22 h 36). Rien n'est modifié ensuite automatiquement. */
+export async function confirmProvisionalCommission(s, what = 'versée'){
+  if (!isCorea(s) || (s.corea_share != null && s.corea_share !== '')) return true;
+  return !!(await confirmAsk('Commission provisoire', `La part du résultat de cette coréalisation n’est pas encore validée : la commission ${what} maintenant ne porte que sur le MG. Son montant restera celui-ci ; après validation de la part, la régularisation éventuelle sera affichée (aucune modification automatique).`, `Confirmer (commission ${what} à titre provisoire)`));
+}
+const sideLabel = (x, w) => w === 'artbo' ? 'L’ArtBoristerie' : (x.partner || 'le coproducteur');
+
+const lineName = id => { const p = id && byId('show_payments', id); return p ? (p.label || p.kind) : ''; };
 export const BUDGET_ACTIONS = {
+  coreaAddTier: t => saveCorea(t.dataset.id, c => { c.tiers.push({label: '', price: null, vat: 5.5, planned: null, qty: null, after: null}); }),
+  coreaDelTier: async t => { const lab = byId('shows', t.dataset.id)?.corea?.tiers?.[Number(t.dataset.i)]?.label;
+    if (await confirmAsk('Retirer le tarif ?', `Retirer le tarif « ${lab || 'sans nom'} » (prix et billets vendus compris) ?`, 'Retirer le tarif', {danger: true}))
+      saveCorea(t.dataset.id, c => { c.tiers.splice(Number(t.dataset.i), 1); }); },
+  coreaAddCharge: t => saveCorea(t.dataset.id, c => { c.charges.push({label: '', amount: null}); }),
+  coreaDelCharge: async t => { const lab = byId('shows', t.dataset.id)?.corea?.charges?.[Number(t.dataset.i)]?.label;
+    if (await confirmAsk('Retirer la charge ?', `Retirer la charge « ${lab || 'sans nom'} » du calcul du résultat partagé ?`, 'Retirer la charge', {danger: true}))
+      saveCorea(t.dataset.id, c => { c.charges.splice(Number(t.dataset.i), 1); }); },
+  // break : validation manuelle obligatoire avant tout calcul (anciens breaks compris) ; une autre valeur la rend caduque
+  coreaValidateBreak: async t => { const s = byId('shows', t.dataset.id);
+    if (!(await confirmAsk('Valider le break ?', `Break de ${s.break_even} billets vendus pour cette date${s.cr_break ? ` (texte du contrat : « ${s.cr_break} »)` : ''}. Le partage sera calculé sur les billets vendus au-delà.`, 'Valider le break'))) return;
+    saveCorea(s.id, c => { c.break_validated_at = new Date().toISOString(); c.break_value = Number(s.break_even); c.break_by = me(); }); },
+  // break des Conditions lu sans ambiguïté (demande du 07/11/2026) : repris dans « Break (billets) » seulement sur ce clic, jamais
+  // validé par ce geste (« Valider le break » reste obligatoire) ; le texte du contrat reste tel quel
+  coreaUseTextBreak: async t => { const s = byId('shows', t.dataset.id), n = breakFromText(s?.cr_break);
+    if (!s || n == null || (s.break_even != null && s.break_even !== '')) return render();
+    if (await save('shows', s.id, {break_even: n})) toast(`Break repris des Conditions : ${n} billets${s.prod_mode === 'booking' ? '' : ' — à valider avant tout calcul'}`); },
+  // jauge ouverte saisie dans un budget (ou le Ticketing) : proposition de compléter les coûts encore vides (demande du 07/11/2026)
+  'change:shows.capacity': async (t, v) => { const old = byId('shows', t.dataset.id)?.capacity;
+    if (!(await save('shows', t.dataset.id, {capacity: v}))) return;
+    if (v != null && Number(v) !== Number(old)) await offerCostFill(t.dataset.id); },
+  fillMissingCosts: t => offerCostFill(t.dataset.id, {manual: true}),
+  // prorata des ventes : jamais appliqué sans validation explicite, pour cette date seulement
+  coreaValidateProrata: async t => { const s = byId('shows', t.dataset.id), k = coreaCalc(s);
+    if (!(await confirmAsk('Valider le prorata ?', `Les ventes après le break ne sont pas connues par tarif. Retenir pour cette date les recettes au prorata des ventes de chaque tarif : ${eur2(k.range.prorata)} HT (fourchette ${eur2(k.range.min)} à ${eur2(k.range.max)}) ?`, 'Valider le prorata'))) return;
+    saveCorea(s.id, c => { c.method = {kind: 'prorata', at: new Date().toISOString(), by: me(), sig: k.sig}; }); },
+  coreaClearMethod: t => saveCorea(t.dataset.id, c => { delete c.method; }),
+  // part du résultat validée : elle entre dans la base de la commission (MG + part, décision du 27/10/2026 au soir) ; une commission
+  // déjà figée (versement, facture) n'est jamais recalculée en silence : elle est signalée, la régularisation se décide à part
+  coreaValidateShare: async t => { const s = byId('shows', t.dataset.id); if (!s) return;
+    // part proposée : saisie dans Conditions en booking (pas de budget de production), calculée dans le Budget en production
+    const booking = s.prod_mode === 'booking', raw = s.corea?.booking_share;
+    const share = booking ? (raw == null || raw === '' ? null : Number(raw)) : coreaCalc(s)?.share;
+    if (share == null || !isFinite(share) || share < 0) return toast(booking ? 'Saisis d’abord la part du résultat HT (0 si le break n’est pas dépassé)' : 'Part du résultat pas encore calculable', true);
+    const mg = Number(s.fee_ht) || 0, rate = commissionPctOf(s), com = Math.round((mg + share) * rate) / 100, q = coreaCommissionCheck(s);
+    const text = [`Part du résultat retenue : ${eur2(share)} HT.`, `Rémunération brute de l’artiste : MG ${eur2(mg)} + part = ${eur2(mg + share)}.`,
+      `Commission L’ArtBo (${pct(rate)}) : ${eur2(com)} sur ce total.`,
+      q?.frozen && Math.abs(com - q.held) >= 0.005 ? `Attention : la commission de cette date est déjà ${q.invoiced ? 'facturée' : q.cashed ? 'encaissée' : 'figée'} à ${eur2(q.held)}. Elle ne sera pas modifiée ; la régularisation (${com - q.held > 0 ? '+' : ''}${eur2(com - q.held)}) sera affichée, rien n’est fait automatiquement.` : ''].filter(Boolean).join('\n');
+    if (!(await confirmAsk('Valider la part du résultat ?', text, 'Valider la part'))) return;
+    await save('shows', s.id, {corea_share: share, corea: {...structuredClone(s.corea || {}), share_validated_at: new Date().toISOString(), share_validated_by: me()}}); },
+  // part du résultat : ligne de facture préparée à la demande (rien n'est envoyé ni créé dans Pennylane) ; montant = part VALIDÉE
+  coreaPrepareInvoice: async t => { const s = byId('shows', t.dataset.id), k = coreaCalc(s);
+    if (k?.validatedShare == null) return toast('Valide d’abord la part du résultat', true);
+    if (k.share == null || Math.abs(k.share - k.validatedShare) >= 0.005) return toast('La part calculée a changé depuis sa validation : valide-la de nouveau', true);
+    if (paymentsOf(s.id).some(p => p.kind === 'autre' && /part du résultat/i.test(p.label || ''))) return toast('Une ligne « Part du résultat » existe déjà dans Factures', true);
+    if (!(await confirmAsk('Préparer la ligne de facture ?', `Ajouter dans Factures une ligne « Part du résultat (coréalisation) » de ${eur2(k.validatedShare)} HT, en plus de l’acompte et du solde du minimum garanti. Rien n’est envoyé.`, 'Préparer la ligne'))) return;
+    await insert('show_payments', {show_id: s.id, kind: 'autre', label: 'Part du résultat (coréalisation)', amount: k.validatedShare, sort: 60});
+    toast('Ligne ajoutée dans Factures'); },
+  // coproduction : clôture du résultat (synthèse, confirmation, enregistrement daté par la base, montants verrouillés)
+  closeResult: async t => { const s = byId('shows', t.dataset.id), k = coprodClose(s), x = k.snapshot;
+    if (!k.ok) return inform({title: 'Clôture impossible', text: k.issues.join('\n')});
+    const text = [`Résultat global réel : ${eur2(x.result)}`, `Part de L’ArtBo (${x.shared_result < 0 ? 'pertes : ' + pct(x.artbo_loss_share) : pct(x.artbo_share)}) : ${eur2(x.artbo_part)}`, `Part de ${x.partner} : ${eur2(x.partner_part)}`,
+      `Recettes encaissées par ${sideLabel(x, x.holder)} : ${eur2(x.net_encaisse)} (nettes)`, `Dépenses payées : L’ArtBo ${eur2(x.paid_artbo)} · coproducteur ${eur2(x.paid_partner)}`,
+      ...(x.promo_debtor_rule === 'commun_historique' ? [`Promotion locale : ${PROMO_LEGACY_LABEL}`] : []),
+      x.from ? `Reversement : ${sideLabel(x, x.from)} reverse ${eur2(x.transfer)} à ${sideLabel(x, x.to)}` : 'Aucun reversement', ...k.warnings,
+      'Après clôture, les montants de la date sont verrouillés ; la réouverture demande un motif.'].join('\n');
+    if (await ask({title: 'Clôturer le résultat ?', text, actions: [{value: 'ok', label: 'Clôturer le résultat'}]}) !== 'ok') return;
+    const {error} = await sb.rpc('close_result', {p_show: s.id, p_snapshot: {...x, at: new Date().toISOString()}});
+    if (error) return toast('Clôture impossible : ' + error.message, true);
+    await refreshFor('shows', 'id', s.id); render(); toast('Résultat clôturé'); },
+  reopenResult: async t => { const s = byId('shows', t.dataset.id);
+    const reason = await askText({title: 'Rouvrir le résultat ?', text: 'Les montants de la date redeviennent modifiables. La réouverture est notée avec son motif.', label: 'Motif de la réouverture', ok: 'Rouvrir le résultat'});
+    if (!reason) return;
+    const {error} = await sb.rpc('reopen_result', {p_show: s.id, p_reason: reason});
+    if (error) return toast('Réouverture impossible : ' + error.message, true);
+    await refreshFor('shows', 'id', s.id); render(); toast('Résultat rouvert'); },
+
   prodAddTicket: t => saveProd(t.dataset.id, p => { p.tickets.push({label: '', qty: 0, price: 0, dl_prod: 0, dl_net: 0}); }),
-  prodDelTicket: t => { if (confirm('Retirer ce tarif ?')) saveProd(t.dataset.id, p => { p.tickets.splice(Number(t.dataset.i), 1); }); },
+  prodDelTicket: async t => { const lab = prodOf(byId('shows', t.dataset.id)).tickets[Number(t.dataset.i)]?.label;
+    if (await confirmAsk('Retirer le tarif ?', `Retirer le tarif « ${lab || 'sans nom'} » de la billetterie de cette date (quantités et prix de ce tarif compris) ?`, 'Retirer le tarif', {danger: true}))
+      saveProd(t.dataset.id, p => { p.tickets.splice(Number(t.dataset.i), 1); }); },
   prefillProduction: async t => {
     const s = byId('shows', t.dataset.id); let sort = nextSort(s.id);
-    const rows = PROD_LINES.map(([category, label]) => ({project_id: s.project_id, show_id: s.id, category, label, payer: 'artbo', sort: sort++}));
+    // date d'un spectacle (v1.57) : les cachets de son budget type (jauge ouverte) remplacent la ligne générique « Cachet artiste »
+    const sp = s.spectacle_id ? byId('spectacles', s.spectacle_id) : null, staff = sp ? spectacleStaffRows(sp, s) : [];
+    const rows = [...PROD_LINES.filter(([c, l]) => !(staff.length && c === 'Promoteur' && l === 'Cachet artiste')).map(([category, label]) => ({category, label})), ...staff]
+      .map(r => ({...r, project_id: s.project_id, show_id: s.id, payer: 'artbo', sort: sort++}));
     const {data, error} = await sb.from('budget_lines').insert(rows).select();
     if (error) return toast('Préremplissage impossible : ' + error.message, true);
     mergeRows('budget_lines', data);
+    if (staff.length) await syncMovinmotionLine(s.id);   // frais Movinmotion des bulletins (coût figé, v1.57)
     if (!s.production) await saveProd(s.id, () => {});
     render(); toast('Budget de production prérempli : indique les quantités et prix unitaires');
   },
   toggleBookingOnly: async t => {
     const s = byId('shows', t.dataset.id), on = t.checked;
-    if (on && linesOf(s.id).length && !confirm('Cette date a déjà un budget. Il sera masqué (pas supprimé) et la date sortira du solde du compte. Continuer ?')){ t.checked = false; return; }
+    if (on && linesOf(s.id).length && !(await confirmAsk('Passer la date en booking uniquement ?', `Cette date a déjà un budget (${linesOf(s.id).length} ligne${linesOf(s.id).length > 1 ? 's' : ''}). Il sera masqué (pas supprimé) et la date sortira du solde du compte.`, 'Passer en booking'))){ t.checked = false; return; }
     if (!(await save('shows', s.id, {prod_mode: on ? 'booking' : 'production', prod_mode_manual: (on ? 'booking' : 'production') !== (byId('projects', s.project_id)?.mode || 'production')}, {rerender: false}))){ render(); return; }   // refusé (facture émise) : le message du garde-fou reste
     // passage en production : la base ajoute l'acompte et le solde manquants (factures déjà faites gardées) ; on les recharge
     if (!on) await refreshFor('show_payments', 'show_id', s.id);
@@ -97,7 +202,9 @@ export const BUDGET_ACTIONS = {
       tr.querySelector(cat === 'Staff' ? '[data-f="supplier"]' : '[data-f="label"]')?.focus({preventScroll: true}); }
   },
   exportArtistBudget: t => exportArtistBudget(t.dataset.id),
-  delBudgetLine: async t => { if (confirm('Supprimer cette ligne du budget ?') && await remove('budget_lines', t.dataset.id)) render(); },
+  delBudgetLine: async t => { const l = byId('budget_lines', t.dataset.id);
+    if (await confirmAsk('Supprimer la ligne du budget ?', `Supprimer la ligne « ${l?.label || l?.category || 'sans nom'} »${l?.amount != null ? ` (${eur2(l.amount)})` : ''} du budget ?`, 'Supprimer la ligne', {danger: true})
+      && await remove('budget_lines', t.dataset.id)) render(); },
   prefillBudget: async t => { await applyTemplate(byId('shows', t.dataset.id)); render(); },
   copyBudget: t => {
     const s = byId('shows', t.dataset.id);
@@ -129,9 +236,13 @@ export const BUDGET_ACTIONS = {
       for (const sid of new Set(out.updated.map(u => S.db.show_payments.find(p => p.id === u.id)?.show_id).filter(Boolean))) await refreshShowSide(sid);
       // factures d'acompte / de solde faites depuis le devis : leur numéro vient d'être repris
       if (out.linked?.length) await refreshFor('show_payments', 'show_id', S.db.shows.filter(x => x.pennylane_quote_id).map(x => x.id));
+      if (out.aRattacher || out.linked?.length){ const {fetchAll} = await import('./data.js'); S.db.pennylane_a_rattacher = await fetchAll('pennylane_a_rattacher'); touch('pennylane_a_rattacher'); }
       render();
       const lines = [out.linked?.length ? `${out.linked.length} facture(s) faite(s) depuis le devis, numéro repris : ${out.linked.filter(Boolean).join(', ')}\n` : '', out.updated.length ? `${out.updated.length} facture(s) marquée(s) payée(s) :\n- ` + out.updated.map(u => u.label).join('\n- ') : (out.linked?.length || out.filed?.done?.length) ? '' : 'Rien de nouveau : la Matrice est à jour.',
+        out.erreurs?.length ? `\nÉcritures REFUSÉES (rien n’a été modifié pour ces lignes) — à examiner :\n- ` + out.erreurs.join('\n- ') : '',
         out.caducs?.length ? `\nFacture(s) Pennylane d’acompte NON reliée(s) : l’acompte est caduc (solde déjà facturé), la date serait facturée au-delà de sa cession — à examiner :\n- ` + out.caducs.join('\n- ') : '',
+        out.douteux?.length ? `\nFacture(s) Pennylane NON reliée(s) au solde : même montant qu’un acompte déjà noté à la main sur la date (numéro, envoi ou paiement) — à rattacher à la main à la bonne ligne :\n- ` + out.douteux.join('\n- ') : '',
+        out.aRattacher ? `\n${out.aRattacher} facture(s) du devis NON reliée(s) automatiquement (plusieurs correspondances possibles, ou montant sans ligne) : « Rattacher… » dans l’onglet Factures de la date.` : '',
         out.pennylaneLate.length ? `\nPayées dans la Matrice mais pas encore dans Pennylane (à mettre à jour dans Pennylane) :\n- ` + out.pennylaneLate.join('\n- ') : '',
         // PDF des factures rangés dans le Drive (compta + dossier de la date)
         out.filed?.done?.length ? `\n${out.filed.done.length} facture(s) rangée(s) dans le Drive (compta › D - Factures de ventes et 02_Finance de la date) :\n- ` + out.filed.done.join('\n- ') : '',
@@ -140,14 +251,59 @@ export const BUDGET_ACTIONS = {
         // la synchronisation ne choisit jamais le compte (§6.6) : les encaissements payés sans compte sont signalés
         (n => n ? `\n${n} encaissement(s) payé(s) sans compte d’encaissement : choisis « Arrive sur » dans l’onglet Factures de la date.` : '')(
           out.updated.map(u => S.db.show_payments.find(p => p.id === u.id)).filter(p => p && ['acompte','solde','autre'].includes(p.kind) && !p.payee && byId('shows', p.show_id)?.prod_mode !== 'booking').length)];
-      alert(lines.join('\n'));
+      await inform({title: 'Synchronisation Pennylane', text: lines.join('\n')});
     } catch (err) { toast(err.message, true); }
     t.disabled = false;
+  },
+  /**
+   * Rattacher (ou corriger le rattachement d') une facture Pennylane du devis à une ligne d'acompte ou de solde de la date (v1.56.9).
+   * Choix explicite de la ligne ; document, montant et associations affichés ; motif obligatoire pour une correction ; confirmation ;
+   * écriture et historique côté serveur (pennylane_rattacher) ; le document Pennylane n'est jamais modifié.
+   */
+  pennylaneAttach: async t => {
+    const s = byId('shows', t.dataset.show), pid = t.dataset.pid; if (!s || !pid) return;
+    const pend = S.db.pennylane_a_rattacher.find(r => r.pennylane_id === pid);
+    const lines = paymentsOf(s.id).filter(p => ['acompte', 'solde'].includes(p.kind) && p.hors_calcul == null);
+    const cur = lines.find(p => p.pennylane_id === pid);
+    const num = cur?.invoice_number || pend?.invoice_number || 'Facture ' + pid, amt = pend?.amount_ht ?? cur?.amount;
+    if (pend?.cancelled_at) return toast('Facture annulée dans Pennylane : elle ne se rattache plus', true);
+    // lignes possibles : sans facture Pennylane ; un n° noté à la main seulement s'il est celui de ce document (cas Monestier) ;
+    // jamais une ligne payée sans n°, ni un acompte caduc (même règle que la base : pennylane_rattacher)
+    const same = n => String(n || '').replace(/[^a-z0-9]/gi, '').toUpperCase() === String(num).replace(/[^a-z0-9]/gi, '').toUpperCase();   // comme la synchronisation (norm)
+    // (acompte « caduc » seulement parce que CETTE facture est sur le solde : il redevient possible — c'est la correction attendue)
+    const targets = lines.filter(p => p.id !== cur?.id && !p.pennylane_id && (acompteState(p) !== 'caduc' || cur?.kind === 'solde')
+      && (!String(p.invoice_number || '').trim() ? !p.paid_at : same(p.invoice_number)));
+    if (!targets.length) return toast('Aucune ligne possible : chaque acompte / solde a déjà une autre facture (ou un paiement sans n°). Corrige d’abord la ligne concernée.', true);
+    const assoc = lines.map(p => `<li>${esc(p.label || p.kind)} · ${eur2(payAmount(p) || 0)} HT · ${p.pennylane_id ? `facture ${esc(p.invoice_number || p.pennylane_id)}` : p.invoice_number ? `n° ${esc(p.invoice_number)} (noté à la main)` : '<span class="muted">aucune facture</span>'}${p.paid_at ? ' · payée' : ''}</li>`).join('');
+    const hist = S.db.pennylane_rattachements.filter(h => h.pennylane_id === pid).sort((a, b) => String(b.at).localeCompare(String(a.at)))
+      .map(h => `<li>${fmtDate(String(h.at).slice(0, 10))} · ${esc(h.actor || '')} · ${esc(lineName(h.from_payment_id) || '—')} → ${esc(lineName(h.to_payment_id) || '—')}${h.motif ? ' · « ' + esc(h.motif) + ' »' : ''}</li>`).join('');
+    await openModal({title: cur ? 'Corriger le rattachement' : 'Rattacher la facture', saveLabel: cur ? 'Corriger' : 'Rattacher',
+      extraTop: `<div class="help full"><p class="m0"><b>${esc(num)}</b> · ${amt != null ? eur2(amt) + ' HT' : 'montant inconnu'}${pend?.invoice_date ? ' · ' + fmtDate(pend.invoice_date) : ''}
+          ${(pend?.url || cur?.pennylane_url) ? ` · <a href="${esc(pend?.url || cur?.pennylane_url)}" target="_blank" rel="noopener">voir le document dans Pennylane ↗</a>` : ''}</p>
+        ${pend?.reason && !pend.resolved_at ? `<p class="m0 warn-txt">${esc(pend.reason)}</p>` : ''}
+        <p class="m0 mt-sm">Lignes de la date :</p><ul class="warn-list">${assoc}</ul>
+        ${hist ? `<p class="m0">Historique de cette facture :</p><ul class="warn-list">${hist}</ul>` : ''}
+        <p class="m0">Le document Pennylane n’est pas modifié. Le numéro, le lien, la date de facture et la date d’envoi suivent la facture.</p></div>`,
+      fields: [{k: 'to', label: 'Ligne de cette facture', type: 'select', full: true, options: targets.map(p => [p.id, `${p.label || p.kind} · ${eur2(payAmount(p) || 0)} HT${p.invoice_number ? ` · n° ${p.invoice_number} noté à la main` : acompteState(p) === 'prevu' ? ' (prévu)' : ''}`])},
+        {k: 'motif', label: cur ? 'Motif de la correction (obligatoire)' : 'Motif (facultatif)', type: 'textarea', full: true, rows: 2}],
+      onSave: async v => {
+        if (!v.to){ toast('Choisis la ligne', true); return false; }
+        if (cur && !String(v.motif || '').trim()){ toast('Indique le motif de la correction', true); return false; }
+        const to = byId('show_payments', v.to);
+        if (!(await confirmAsk(cur ? 'Corriger le rattachement ?' : 'Rattacher la facture ?', `${num} (${amt != null ? eur2(amt) + ' HT' : 'montant inconnu'}) ${cur ? `passe de « ${cur.label || cur.kind} » à` : 'est rattachée à'} « ${to?.label || to?.kind} ». ${cur ? 'La ligne quittée redevient « non facturée ». ' : ''}Le document Pennylane n’est pas modifié ; le choix est gardé aux synchronisations suivantes.`, cur ? 'Corriger' : 'Rattacher'))) return false;
+        const {data, error} = await sb.rpc('pennylane_rattacher', {p_pennylane_id: pid, p_payment: v.to, p_motif: v.motif || null});
+        if (error){ toast(error.message, true); return false; }
+        await refreshFor('show_payments', 'show_id', [s.id]);
+        for (const tb of ['pennylane_a_rattacher', 'pennylane_rattachements']){ const {fetchAll} = await import('./data.js'); S.db[tb] = await fetchAll(tb); touch(tb); }
+        toast(`${data?.invoice_number || num} rattachée à « ${to?.label || to?.kind} »`); render();
+        return true;
+      }});
   },
   testPennylane: async () => { try { const out = await pennylane('status', {}); toast(`Pennylane OK : ${out.company || 'compte connecté'}`); } catch (err) { toast(err.message, true); } },
   pennylaneQuote: async t => {
     const s = byId('shows', t.dataset.id);
-    if (s.pennylane_quote_id && !confirm('Un devis a déjà été créé dans Pennylane pour cette date. En créer un nouveau ?')) return;
+    if (isCoproduction(s)) return toast('Coproduction : pas de devis Pennylane (le résultat n’est pas connu) ; les factures se préparent après la clôture', true);
+    if (s.pennylane_quote_id && !(await confirmAsk('Créer un nouveau devis ?', 'Un devis a déjà été créé dans Pennylane pour cette date. Le nouveau devis s’ajoute à l’ancien (rien n’est supprimé dans Pennylane).', 'Créer un nouveau devis'))) return;
     t.disabled = true; toast('Création du devis dans Pennylane…');
     try { const out = await pennylane('quote', {show_id: s.id}); await save('shows', s.id, {pennylane_quote_id: String(out.id), pennylane_quote_url: out.url || null}); toast(`Devis ${out.number || ''} créé dans Pennylane${out.headers === false ? ' (complète « Projet » et « Date de réalisation » dans Pennylane)' : ''}`); }
     catch (err) { toast(err.message, true); }
@@ -173,6 +329,7 @@ export const BUDGET_ACTIONS = {
   },
   pennylaneInvoice: async t => {
     const p = byId('show_payments', t.dataset.id);
+    if (p?.kind === 'artbo' && !(await confirmProvisionalCommission(byId('shows', p.show_id), 'facturée'))) return;
     t.disabled = true; toast('Création de la facture en brouillon dans Pennylane…');
     try { const out = await pennylane('invoice', {payment_id: p.id}); await save('show_payments', p.id, {pennylane_id: String(out.id), pennylane_url: out.url || null}); toast(`Facture créée en brouillon dans Pennylane${out.headers === false ? ' (complète « Projet » et « Date de réalisation »)' : ''}`); }
     catch (err) { toast(err.message, true); }
@@ -199,7 +356,9 @@ export async function readPieces(ctx, files){
     const folder = `budget/${show?.id || line?.show_id || 'projet-' + project_id}`;
     const path = `${folder}/${Date.now()}_${safeName(file.name)}`;
     toast(`Lecture de « ${file.name} » par l’IA…`);
-    const {error: upErr} = await sb.storage.from('suivi').upload(path, file, {contentType: file.type || 'application/octet-stream'});
+    let upErr;
+    try { ({error: upErr} = await sb.storage.from('suivi').upload(path, typedFile(file), {contentType: contentTypeOf(file)})); }
+    catch (err){ upErr = {message: await uploadFailure(file, err)}; }
     if (upErr){ toast(`${file.name} : ${upErr.message}`, true); continue; }
     let doc = null;
     const {data, error} = await sb.functions.invoke('lire-piece', {body:{path, show_id: show?.id || line?.show_id || null, project_id}});
@@ -301,7 +460,7 @@ export async function applyPiece({doc, path, name, show_id, project_id, line}){
   const s = show_id ? byId('shows', show_id) : null;
   const bulletin = d.type === 'bulletin';
   const amount = bulletin ? (d.cout_employeur ?? ttc ?? ht) : (ht ?? ttc);
-  const patch = {doc_number: d.numero || (bulletin ? `BDS ${String(date).slice(0,7)}` : null), doc_date: date, paid_at: date, file_path: path, file_name: name,
+  const patch = {doc_number: d.numero || (bulletin ? `BDS ${String(date).slice(0,7)}` : null), doc_date: date, file_path: path, file_name: name,   // jamais paid_at : un justificatif n'est pas un paiement (v1.46a)
     ...(amount != null ? {amount: Number(amount)} : {}), ...(ttc != null ? {amount_ttc: ttc} : {}), ...(d.tva_taux != null ? {vat_rate: Number(d.tva_taux)} : {})};
   let target = line;
   if (!target && s){
@@ -314,14 +473,14 @@ export async function applyPiece({doc, path, name, show_id, project_id, line}){
   }
   if (target){
     await save('budget_lines', target.id, {...patch, supplier: target.supplier || (bulletin ? d.personne : d.emetteur) || null}, {rerender:false});
-    toast(`Ligne « ${target.label || target.category} » mise à jour : ${d.numero || name} (payée le ${fmtDate(date)})`);
+    toast(`Ligne « ${target.label || target.category} » mise à jour : ${d.numero || name} (pièce rattachée ; le paiement se note à part)`);
     return {table: 'budget_lines', id: target.id};
   }
   const row = await insert('budget_lines', {project_id, show_id: s?.id || null, category: bulletin ? 'Staff' : (d.categorie || 'Autres'),
     label: d.libelle || (bulletin ? 'Cachet' : name), supplier: (bulletin ? d.personne : d.emetteur) || null, payer: 'compte',
     qty: bulletin ? 1 : null, sort: s ? nextSort(s.id) : 0, ...patch});
   if (row && bulletin && s) await syncMovinmotionLine(s.id);
-  if (row) toast(`Nouvelle ligne ajoutée : ${row.label} (${row.category})`);
+  if (row) toast(`Nouvelle ligne ajoutée : ${row.label} (${row.category}) ; le paiement se note à part`);
   return row ? {table: 'budget_lines', id: row.id} : null;
 }
 
@@ -333,7 +492,9 @@ document.addEventListener('dragover', e => { if (!e.dataTransfer?.types?.include
 document.addEventListener('dragleave', e => { const z = e.target.closest?.('.budget-over'); if (z && !z.contains(e.relatedTarget)) z.classList.remove('budget-over'); }, true);
 document.addEventListener('drop', e => { const ctx = ctxOf(e.target); if (!ctx) return; e.preventDefault(); e.stopPropagation();
   document.querySelectorAll('.budget-over').forEach(x => x.classList.remove('budget-over'));
-  const files = [...(e.dataTransfer?.files || [])]; if (files.length) readPieces(ctx, files); }, true);
+  if (!e.dataTransfer?.files?.length) return;
+  // (v1.60.3) pièce copiée en mémoire dès le dépôt (fichier temporaire d'une autre application, ex. pièce jointe glissée depuis Mail)
+  takeDropped(e).then(({files}) => { if (files.length) readPieces(ctx, files); }); }, true);
 document.addEventListener('change', e => { const t = e.target; if (!t.dataset?.budgetPick) return; const files = [...t.files]; t.value = '';
   if (files.length) readPieces(JSON.parse(t.dataset.budgetPick), files); });
 

@@ -7,33 +7,56 @@
  * Chaque ligne a un montant prévu (saisi ou calculé) et un montant réel (lu sur la pièce) ; elle est « payée » quand paid_at est rempli.
  * Une date cochée « booking uniquement » (prod_mode = booking) n'a pas de budget : seulement la facture de commission.
  */
-import { isInvoiced, payAmount, paymentsOf } from './calc.js';
+import { r2 } from './utils.js';
+import { commissionState, isBookingShow, isCoproduction, isInvoiced, payAmount, paymentsOf } from './calc.js';
 import { CONFIRMED_PROD } from './constants.js';
-import { byId, setting, showsOfProject } from './selectors.js';
+import { byId, setting, showCommissionPct, showsOfProject } from './selectors.js';
+import { cnmBearer, cnmOf, commissionBase, commissionPctOf, coreaShareOf, isAbroad, isCnmLine, isCorea } from './corea.js';
 import { S } from './state.js';
 
 const num = v => v==null || v==='' ? null : Number(v);
-const r2 = n => Math.round(n * 100) / 100;
 
 export const isProdShow = s => !!s && s.prod_mode !== 'booking';
 export const isFree = s => /gratuit/i.test(s?.ticketing_type || '');
-/** Date à l'étranger : département remplacé par un code pays (CH, BE…) ou structure hors de France */
-export const isAbroad = s => { const d = String(s?.department || '').trim().toUpperCase(), c = byId('structures', s?.structure_id)?.country;
-  if (d) return /^[A-Z]{2,}$/.test(d) && !/^2[AB]$/.test(d);   // le département du concert fait foi
-  return !!c && !/^france$/i.test(c); };
-/** Taxe CNM due : entrée gratuite, en France */
-export const cnmDue = s => isFree(s) && !isAbroad(s);
+export { isAbroad, isCnmLine, isSacemLine } from './corea.js';   // une seule définition (v1.51)
+/** Taxe CNM dans le budget de la date : en France, quand L'ArtBo en supporte le coût (v1.51 : structure saisie sur la date,
+ *  sinon l'usage habituel — gratuit → L'ArtBo, payant → l'organisateur ; coréalisation payante : à attribuer) */
+export const cnmDue = s => cnmBearer(s) === 'artbo' && !isAbroad(s);
 export const payslipCost = () => num(setting('movinmotion_payslip_cost')) ?? 20.3;
-export const cnmPct = () => num(setting('default_cnm_pct')) ?? 3.5;
+export const cnmPct = () => num(setting('default_cnm_pct')) ?? 3.5;   // taux des Réglages ; taux d'une date : cnmRate (corea.js)
 
 export const linesOf = showId => S.db.budget_lines.filter(l => l.show_id === showId).sort((a,b) => (a.sort||0)-(b.sort||0) || (a.created_at||'').localeCompare(b.created_at||''));
 export const offLinesOf = projectId => S.db.budget_lines.filter(l => !l.show_id && l.project_id === projectId).sort((a,b) => (a.doc_date||'').localeCompare(b.doc_date||'') || (a.created_at||'').localeCompare(b.created_at||''));
 
 export const commissionOf = s => paymentsOf(s.id).find(p => p.kind === 'artbo');
-export const commissionAmount = s => { const p = commissionOf(s); return p ? payAmount(p) || 0 : r2((Number(s.fee_ht)||0) * (Number(s.artbo_pct ?? 15)||0) / 100); };
+// coproduction sans ligne de commission réelle : aucune commission (jamais calculée sur le cachet, décision du 27/10/2026)
+export const commissionAmount = s => { const p = commissionOf(s); return p ? payAmount(p) || 0 : isCoproduction(s) ? 0 : r2(commissionBase(s) * showCommissionPct(s) / 100); };   // coréalisation : MG + part validée (v1.51)
+
+/**
+ * Commission d'une coréalisation (décision d'Anthony du 27/10/2026, 22 h 35) : due = (MG + part validée) × taux ; une commission
+ * déjà FACTURÉE (booking : envoyée, numérotée, liée à Pennylane) ou ENCAISSÉE (booking : payée ; production : versée à L'ArtBo)
+ * garde son montant historique ; l'écart éventuel est AFFICHÉ comme régularisation à prévoir, jamais fait automatiquement.
+ */
+const filledV = v => v != null && String(v).trim() !== '';
+export function coreaCommissionCheck(s){
+  const p = isCorea(s) ? commissionOf(s) : null; if (!p) return null;
+  const booking = isBookingShow(s), held = r2(payAmount(p) || 0), due = r2(Math.round(commissionBase(s) * commissionPctOf(s)) / 100);
+  const invoiced = booking && ['sent_at', 'invoice_number', 'pennylane_id'].some(k => filledV(p[k]));
+  const cashed = booking ? (filledV(p.paid_at) ? held : 0) : commissionState(p).transferred;
+  const frozen = filledV(p.amount) || isInvoiced(p) || cashed > 0;
+  return {booking, due, held, invoiced, cashed, frozen, gap: frozen ? r2(due - held) : 0};
+}
 
 /** Ligne de solde artiste (automatique ou ajoutée à la main / par une pièce) : comptée une seule fois, dans le solde */
 export const isSolde = l => l.auto === 'solde_artiste' || l.category === 'Solde artiste';
+/**
+ * Ligne CNM d'une coréalisation dont la CNM est AUSSI « déduite du résultat partagé » (précisions d'Anthony du 07/11/2026) : la
+ * déduction de l'assiette partagée ne dit pas, à elle seule, qui paie la CNM ni qui en récupère le montant. Les dépenses et le reste
+ * artiste n'en tiennent PAS compte (inchangés, en attente du rapprochement des dates réelles : tools/rapprochement-cnm.mjs) ; seul le
+ * break PRÉVISIONNEL (js/break.js) ne la déduit qu'une fois.
+ */
+export const cnmViaShare = l => { if (!l || !isCnmLine(l) || !l.show_id) return false; const s = byId('shows', l.show_id);
+  return !!s && isCorea(s) && !!s.cnm_in_result; };
 
 const staffQty = showId => linesOf(showId).filter(l => l.category === 'Staff').reduce((t,l) => t + (Number(l.qty)||0), 0);
 
@@ -42,33 +65,53 @@ export function lineForecast(l){
   if (l.forecast != null && !isSolde(l)) return Number(l.forecast);   // le solde artiste n'a pas de prévu saisi : c'est toujours le reste calculé
   if (!l.auto && l.qty != null && l.unit_cost != null) return r2(Number(l.qty) * Number(l.unit_cost));   // quantité × prix unitaire (salariés, salle, promoteur…)
   const s = byId('shows', l.show_id);
-  if (l.auto === 'movinmotion' && s) return r2(payslipCost() * staffQty(s.id));
-  if (l.auto === 'cnm' && s) return cnmDue(s) ? r2((Number(s.fee_ht)||0) * cnmPct() / 100) : 0;
+  // coût par bulletin figé sur la ligne (v1.57) ; ancienne ligne sans coût figé : le réglage du moment, comme avant
+  if (l.auto === 'movinmotion' && s) return r2((l.unit_cost != null ? Number(l.unit_cost) : payslipCost()) * staffQty(s.id));
+  if (l.auto === 'cnm' && s){
+    // une dépense CNM réelle saisie à part remplace le calcul (jamais les deux)
+    // (B6) une ligne CNM saisie à la main, même seulement prévue, remplace aussi le calcul (copie d'une autre date…)
+    if (linesOf(s.id).some(x => x.id !== l.id && !x.auto && isCnmLine(x) && (x.amount != null || x.forecast != null))) return 0;
+    return cnmDue(s) ? cnmOf(s).amount ?? 0 : 0;
+  }
   if (l.auto === 'solde_artiste' && s){   // ce qui reste du cachet, moins les autres soldes déjà notés
     const others = linesOf(s.id).filter(x => isSolde(x) && x.id !== l.id).reduce((t,x) => t + (x.amount != null ? Number(x.amount) : 0), 0);   // les autres versements ne comptent que par leur montant saisi
     return Math.max(0, r2(availableForArtist(s) - others));
   }
   return null;
 }
+/**
+ * Coût à renseigner (demande d'Anthony du 07/11/2026) : ligne saisie (pas automatique, pas un solde artiste) dont la QUANTITÉ est
+ * connue mais pas le prix (ex. cachets du budget type posés sans jauge ou sans coût dans le spectacle), sans prévu ni réel saisi.
+ * Elle compte pour 0 dans les totaux : le budget est alors « incomplet », jamais présenté comme fiable ou définitif.
+ */
+const filledN = v => v != null && v !== '';
+export const isMissingCost = l => !!l && !l.auto && !isSolde(l) && !filledN(l.amount) && !filledN(l.forecast)
+  && filledN(l.qty) && Number(l.qty) > 0 && !filledN(l.unit_cost);
+/** Lignes d'une date dont le coût reste à renseigner */
+export const missingCostLines = showId => linesOf(showId).filter(isMissingCost);
+/** Texte commun « Budget incomplet — coûts à renseigner » (synthèse, reste artiste, points d'équilibre, export) */
+export const INCOMPLETE = 'Budget incomplet — coûts à renseigner';
+export const missingCostText = ls => `${INCOMPLETE} : ${ls.map(l => l.label || l.category || 'ligne sans libellé').join(' ; ')}`;
 /** Montant retenu : le réel s'il est connu, sinon le prévu */
 export const lineValue = l => l.amount != null ? Number(l.amount) : (lineForecast(l) || 0);
 export const lineStatus = l => l.paid_at || l.reimbursed_at ? 'paid' : (l.doc_number || l.file_path || l.amount != null) ? 'doc' : 'planned';
 
-/** Cachet − commission − dépenses (hors solde artiste) = ce qui peut revenir à l'artiste */
+/** Rémunération brute − commission − dépenses (hors solde artiste) = ce qui peut revenir à l'artiste.
+ *  Brute = cachet HT (MG), plus la part du résultat validée en coréalisation (v1.51) ; la commission n'est retirée qu'une fois. */
 export function availableForArtist(s){
   const out = linesOf(s.id).filter(l => !isSolde(l)).reduce((t,l) => t + lineValue(l), 0);
-  return (Number(s.fee_ht)||0) - commissionAmount(s) - out;
+  return commissionBase(s) - commissionAmount(s) - out;
 }
 
 export function showBudget(s){
   const lines = linesOf(s.id);
-  const fee = Number(s.fee_ht)||0, com = commissionAmount(s);
+  const fee = Number(s.fee_ht)||0, share = coreaShareOf(s), gross = r2(fee + share), com = commissionAmount(s);
   const expenses = lines.filter(l => !isSolde(l)).reduce((t,l) => t + lineValue(l), 0);
   const solde = lines.filter(isSolde).reduce((t,l) => t + lineValue(l), 0);
   const forecastExp = lines.filter(l => !isSolde(l)).reduce((t,l) => t + (lineForecast(l) ?? (Number(l.amount)||0)), 0);
   const docs = lines.filter(l => lineValue(l) !== 0);
-  return {fee, com, expenses: r2(expenses), forecastExp: r2(forecastExp), available: r2(fee - com - expenses), solde: r2(solde),
-    result: r2(fee - com - expenses - solde), lines,
+  return {fee, share, gross, com, expenses: r2(expenses), forecastExp: r2(forecastExp), available: r2(gross - com - expenses), solde: r2(solde),
+    result: r2(gross - com - expenses - solde), lines,
     docsIn: docs.filter(l => l.doc_number || l.file_path).length, docsAll: docs.length, paid: docs.filter(l => l.paid_at).length};
 }
 
@@ -104,6 +147,8 @@ export function accountOf(projectId){
     const conf = confirmed(s);   // date non confirmée (annulée…) : seuls ses mouvements FAITS comptent
     for (const pay of paymentsOf(s.id)){
       const v = payAmount(pay) || 0;
+      // commission (lot D1) : seuls les versements réels sortent du compte ; le reste à transférer reste « à venir »
+      if (pay.kind === 'artbo'){ const st = commissionState(pay); a.outDone += st.transferred; if (conf) a.outTodo += st.remaining; continue; }
       if (!conf && !pay.paid_at) continue;
       // acompte prévu ou caduc (pas facturé) : déjà compris dans le solde (cession − acomptes facturés), jamais compté deux fois (lot C1)
       if (pay.kind === 'acompte' && !isInvoiced(pay)) continue;
@@ -112,7 +157,6 @@ export function accountOf(projectId){
         if (who === 'compte') pay.paid_at ? a.inDone += v : a.inTodo += v;
         else if (!who) pay.paid_at ? a.unassignedDone += v : a.unassignedTodo += v;
       }
-      if (pay.kind === 'artbo') pay.paid_at ? a.outDone += v : a.outTodo += v;
     }
     if (conf) a.byCat['Commission'] = (a.byCat['Commission']||0) + commissionAmount(s);
   }
@@ -144,13 +188,19 @@ export function accountOf(projectId){
 export function accountMoves(projectId){
   const p = byId('projects', projectId), moves = [];
   const isOwnProd = s => /^(Production|Co-Production)$/.test(s?.contract_type || '');
-  const where = s => s ? `${s.venue || '?'} (${String(s.date || '').split('-').reverse().join('/')})` : 'hors date';
+  const where = s => s ? `${s.venue || '?'} (${String(s.date || '').split('-').reverse().join('/')}${s.archived_at ? ', date archivée' : ''})` : 'hors date';   // v1.60.3
   for (const s of accountShowsOf(projectId).filter(x => !isOwnProd(x))){
     for (const pay of paymentsOf(s.id)){
+      // commission (lot D1) : un mouvement par versement réel (date, référence) ; commission versée avant ce lot sans détail : un mouvement
+      if (pay.kind === 'artbo'){
+        const st = commissionState(pay);
+        if (st.legacy && st.total) moves.push({date: pay.paid_at, label: `Commission L'ArtBo — ${where(s)}`, amount: -st.total, calc: pay.amount == null || pay.amount === ''});
+        for (const t of st.transfers) moves.push({date: t.transferred_at, label: `Commission L'ArtBo — ${where(s)}${st.transfers.length > 1 || st.remaining ? ' (versement)' : ''}${t.reference ? ' · ' + t.reference : ''}`, amount: -Number(t.amount), calc: false});
+        continue;
+      }
       const v = payAmount(pay) || 0; if (!pay.paid_at || !v) continue;   // payee vide : « Non renseigné », pas un mouvement du compte
       if (['acompte','solde','autre'].includes(pay.kind) && payee(pay) === 'compte')
         moves.push({date: pay.paid_at, label: `${pay.label || pay.kind} — ${where(s)}`, amount: v, calc: pay.amount == null || pay.amount === ''});
-      if (pay.kind === 'artbo') moves.push({date: pay.paid_at, label: `Commission L'ArtBo — ${where(s)}`, amount: -v, calc: pay.amount == null || pay.amount === ''});
     }
   }
   const lines = S.db.budget_lines.filter(l => l.project_id === projectId && accountLineOk(l));
@@ -167,5 +217,5 @@ export function accountMoves(projectId){
 
 /** Libellés des payeurs pour un projet */
 export function payerLabel(code, project){
-  return ({compte: project?.account_name || 'Compte dédié', artbo: "L'ArtBo", artiste: project?.artist_payee || 'Artiste', organisateur: 'Organisateur', autre: 'Autre'})[code || 'compte'] || code;
+  return ({compte: project?.account_name || 'Compte dédié', artbo: "L'ArtBo", artiste: project?.artist_payee || 'Artiste', organisateur: 'Organisateur', partenaire: 'Coproducteur', autre: 'Autre'})[code || 'compte'] || code;
 }
